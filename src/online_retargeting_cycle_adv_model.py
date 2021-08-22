@@ -13,7 +13,7 @@ from ops import relu
 from tensorflow import atan2
 from tensorflow import asin
 
-layer_norm = tf.contrib.layers.layer_norm
+layer_norm = tf.keras.layers.LayerNormalization
 
 
 class EncoderDecoderGRU(object):
@@ -345,12 +345,12 @@ class EncoderDecoderGRU(object):
       num_param = 0
       for var in self.gvars:
         num_param += int(np.prod(var.get_shape()))
-      print "NUMBER OF G PARAMETERS: " + str(num_param)
+      print("NUMBER OF G PARAMETERS: " + str(num_param))
 
       num_param = 0
       for var in self.dvars:
         num_param += int(np.prod(var.get_shape()))
-      print "NUMBER OF D PARAMETERS: " + str(num_param)
+      print("NUMBER OF D PARAMETERS: " + str(num_param))
 
     self.saver = tf.train.Saver()
 

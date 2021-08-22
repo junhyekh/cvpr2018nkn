@@ -229,7 +229,7 @@ def load_testdata(min_steps, max_steps, is_h36m=False):
           ]
           ito_keep = [0]
           for jname in joints_list:
-            for k in xrange(len(ibvh_joints)):
+            for k in range(len(ibvh_joints)):
               if jname == ibvh_joints[k][-len(jname):]:
                 ito_keep.append(k + 1)
                 break
@@ -242,7 +242,7 @@ def load_testdata(min_steps, max_steps, is_h36m=False):
           ]
           tto_keep = [0]
           for jname in joints_list:
-            for k in xrange(len(tbvh_joints)):
+            for k in range(len(tbvh_joints)):
               if jname == tbvh_joints[k][-len(jname):]:
                 tto_keep.append(k + 1)
                 break
@@ -281,7 +281,7 @@ def load_testdata(min_steps, max_steps, is_h36m=False):
           inseq = np.reshape(inseq[:, :-8], [inseq.shape[0], -1, 3])
           num_samples = inseq.shape[0] // max_steps
 
-          for s in xrange(num_samples):
+          for s in range(num_samples):
             inpjoints.append(ito_keep)
             tgtjoints.append(tto_keep)
             inpanims.append([
