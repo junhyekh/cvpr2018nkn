@@ -322,10 +322,10 @@ class EncoderDecoderGRU(object):
         doptimizer = tf.train.RMSPropOptimizer(
             self.learning_rate, name="doptimizer")
       elif optim_name == "adam":
-        goptimizer = tf.train.AdamOptimizer(
+        goptimizer = tf.keras.optimizers.Adam(
             self.learning_rate, beta1=0.5, name="goptimizer")
 
-        doptimizer = tf.train.AdamOptimizer(
+        doptimizer = tf.keras.optimizers.Adam(
             self.learning_rate, beta1=0.5, name="doptimizer")
       else:
         raise Exception("Unknown optimizer")

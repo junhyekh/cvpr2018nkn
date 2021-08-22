@@ -86,7 +86,7 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
 
   n_joints = alllocal[0].shape[-2]
 
-  for i in xrange(len(trainlocal)):
+  for i in range(len(trainlocal)):
     trainlocal[i] = (trainlocal[i] - local_mean) / local_std
     trainglobal[i] = (trainglobal[i] - global_mean) / global_std
     trainskel[i] = (trainskel[i] - local_mean) / local_std
@@ -155,7 +155,7 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
           aeReg_batch = np.zeros((batch_size, 1), dtype="float32")
           mask_batch = np.zeros((batch_size, max_steps), dtype="float32")
 
-          for b in xrange(batch_size):
+          for b in range(batch_size):
             low = 0
             high = trainlocal[batchidx[b]].shape[0] - max_steps
             if low >= high:
