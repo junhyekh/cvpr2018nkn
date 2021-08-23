@@ -133,7 +133,7 @@ def get_vels(input_, n_joints, dmean, dstd, omean, ostd):
   axis = tf.constant(axis)
   joints_list = []
 
-  for t in xrange(int(joints.shape[1])):
+  for t in range(int(joints.shape[1])):
     joints_list.append(q_mul_v(rotation, joints[:, t, :, :]))
     joints_x = joints_list[-1][:, :, 0:1] + translation[:, 0:1, 0:1]
     joints_y = joints_list[-1][:, :, 1:2] + translation[:, 0:1, 1:2]
@@ -185,13 +185,13 @@ def q_neg(a):
 def q_broadcast(sqs, oqs):
   if int(sqs.shape[-2]) == 1:
     sqsn = []
-    for l in xrange(oqs.shape[-2]):
+    for l in range(oqs.shape[-2]):
       sqsn.append(sqs)
     sqs = tf.concat(sqsn, axis=-2)
 
   if int(oqs.shape[-2]) == 1:
     oqsn = []
-    for l in xrange(sqs.shape[-2]):
+    for l in range(sqs.shape[-2]):
       oqsn.append(oqs)
     oqs = tf.concat(oqsn, axis=-2)
 

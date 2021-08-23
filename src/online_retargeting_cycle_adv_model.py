@@ -58,6 +58,12 @@ class EncoderDecoderGRU(object):
     self.margin = margin
     self.fake_score = 0.5
     self.norm_type = norm_type
+    self.layers_units=layers_units
+    self.dstd=dstd
+    self.dmean=dmean
+    self.omean=omean
+    self.ostd=ostd
+    self.parents=parents
 
     self.realSeq_ = tf.placeholder(
         tf.float32,
@@ -79,8 +85,8 @@ class EncoderDecoderGRU(object):
         tf.float32, shape=[batch_size, max_len], name="mask")
     self.kp_ = tf.placeholder(tf.float32, shape=[], name="kp")
 
-    enc_gru = self.gru_model(layers_units)
-    dec_gru = self.gru_model(layers_units)
+    self.enc_gru = self.gru_model(layers_units)
+    self.dec_gru = self.gru_model(layers_units)
 
     b_local = []
     b_global = []
@@ -354,101 +360,183 @@ class EncoderDecoderGRU(object):
 
     self.saver = tf.train.Saver()
 
-  def mlp_out(self, input_, reuse=False, name="mlp_out"):
-    out = qlinear(input_, 4 * (self.n_joints + 1), name="dec_fc")
-    return out
+  def generator(self, trainning=False):
+    seqA_ = tf.keras.layers.Input(
+        shape=(self.max_len, 3 * self.n_joints + 4),
+        name="seqA")
+    skelB_ = tf.keras.layers.Input(
+        shape=(self.max_len, 3 * self.n_joints),
+        name="skelB")
+
+    b_local = []
+    b_global = []
+    b_quats = []
+    a_local = []
+    a_global = []
+    a_quats = []
+    reuse = False
+
+    statesA_AB = ()
+    statesB_AB = ()
+    statesA_BA = ()
+    statesB_BA = ()
+    fc=tf.keras.layers.Dense(4 * (self.n_joints + 1))
+    for units in self.layers_units:
+      statesA_AB += (tf.zeros([self.batch_size, units]), )
+      statesB_AB += (tf.zeros([self.batch_size, units]), )
+      statesA_BA += (tf.zeros([self.batch_size, units]), )
+      statesB_BA += (tf.zeros([self.batch_size, units]), )
+
+    for t in range(self.max_len):
+      """Retarget A to B"""
+      with tf.variable_scope("Encoder", reuse=reuse):
+        ptA_in = seqA_[:, t, :]
+
+        _, statesA_AB = self.enc_gru([ptA_in], initial_state=statesA_AB)
+      with tf.variable_scope("Decoder", reuse=reuse):
+        if t == 0:
+          ptB_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
+        else:
+          ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
+
+        ptcombined = tf.concat(
+            values=[skelB_[:, 0, 3:], ptB_in, statesA_AB[-1]], axis=1)
+        _, statesB_AB = self.dec_gru([ptcombined], initial_state=statesB_AB)
+        angles_n_offset = fc(statesB_AB[-1])
+        output_angles = tf.reshape(angles_n_offset[:, :-4],
+                                   [self.batch_size, self.n_joints, 4])
+        b_global.append(angles_n_offset[:, -4:])
+        b_quats.append(self.normalized(output_angles))
+
+        skel_in = tf.reshape(self.skelB_[:, 0, :], [self.batch_size, self.n_joints, 3])
+        skel_in = skel_in * self.dstd + self.dmean
+
+        output = (self.fk.run(self.parents, skel_in, output_angles) - self.dmean) / self.dstd
+        output = tf.reshape(output, [self.batch_size, -1])
+        b_local.append(output)
+      """Retarget B back to A"""
+      with tf.variable_scope("Encoder", reuse=True):
+        ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
+
+        _, statesB_BA = self.enc_gru([ptB_in], initial_state=statesB_BA)
+
+      with tf.variable_scope("Decoder", reuse=True):
+        if t == 0:
+          ptA_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
+        else:
+          ptA_in = tf.concat([a_local[-1], a_global[-1]], axis=-1)
+
+        ptcombined = tf.concat(
+            values=[self.skelA_[:, 0, 3:], ptA_in, statesB_BA[-1]], axis=1)
+        _, statesA_BA = self.dec_gru([ptcombined], initial_state=statesA_BA)
+        angles_n_offset = fc(statesA_BA[-1])
+        output_angles = tf.reshape(angles_n_offset[:, :-4],
+                                  [self.batch_size, self.n_joints, 4])
+        a_global.append(angles_n_offset[:, -4:])
+        a_quats.append(self.normalized(output_angles))
+
+        skel_in = tf.reshape(self.skelA_[:, 0, :], [self.batch_size, self.n_joints, 3])
+        skel_in = skel_in * self.dstd + self.dmean
+
+        output = (self.fk.run(self.parents, skel_in, output_angles) - self.dmean) / self.dstd
+        output = tf.reshape(output, [self.batch_size, -1])
+        a_local.append(output)
+
+        reuse = True
+      return tf.keras.Model(inputs=[seqA_, skelB_], outputs=[b_local, b_global, b_quats, a_local, a_global, a_quats]) 
+
+  # def mlp_out(self, input_, reuse=False, name="mlp_out"):
+  #   out = qlinear(input_, 4 * (self.n_joints + 1), name="dec_fc")
+  #   return out
 
   def gru_model(self, layers_units, rnn_type="GRU"):
-    gru_cells = [tf.contrib.rnn.GRUCell(units) for units in layers_units]
-    gru_cells = [
-        tf.contrib.rnn.DropoutWrapper(cell, input_keep_prob=self.kp)
-        for cell in gru_cells
-    ]
-    stacked_gru = tf.contrib.rnn.MultiRNNCell(gru_cells)
-    return stacked_gru
+    gru_cells = [tf.keras.layers.GRUCell(units, dropout=self.kp) for units in layers_units]
+    gru_layer=tf.keras.layers.RNN(gru_cells, return_state=True)
+    return gru_layer
 
   def discriminator(self, input_, cond_):
-    if self.norm_type == "batch_norm":
-      from ops import batch_norm as norm
-    elif self.norm_type == "instance_norm":
-      from ops import instance_norm as norm
+    x=tf.keras.layers.Input(shape=input_.get_shape())
+    cond=tf.keras.layers.Input(shape=cond_.get_shape())
+    drop=tf.keras.Input(shape=(1,))
+    norm=tf.keras.layers.BatchNormalization()
+    lrelu=tf.keras.layers.LeakyReLU()
+    if drop==1:
+      x=tf.keras.layers.Dropout(0.7)(x)
     else:
-      raise Exception("Unknown normalization layer!!!")
-
-    if not self.norm_type == "instance_norm":
-      input_ = tf.nn.dropout(input_, self.kp_)
-
+      x=tf.keras.layers.Dropout(1.0)(x)
     if self.d_arch == 0:
-      h0 = lrelu(conv1d(input_, 128, k_w=4, name="conv1d_h0"))
-      h1 = lrelu(norm(conv1d(h0, 256, k_w=4, name="conv1d_h1"), "bn1"))
-      h1 = tf.concat([h1, tf.tile(cond_, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2 = lrelu(norm(conv1d(h1, 512, k_w=4, name="conv1d_h2"), "bn2"))
-      h2 = tf.concat([h2, tf.tile(cond_, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3 = lrelu(norm(conv1d(h2, 1024, k_w=4, name="conv1d_h3"), "bn3"))
-      h3 = tf.concat([h3, tf.tile(cond_, [1, int(h3.shape[1]), 1])], axis=-1)
-      logits = conv1d(h3, 1, k_w=4, name="logits", padding="VALID")
+      h0=lrelu(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h0")(x))
+      h1=lrelu(norm(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
+      h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
+      h2=lrelu(norm(tf.keras.layers.Conv1D(512, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
+      h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
+      h3=lrelu(norm(tf.keras.layers.Conv1D(1024, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
+      h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
+      logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
     elif self.d_arch == 1:
-      h0 = lrelu(conv1d(input_, 64, k_w=4, name="conv1d_h0"))
-      h1 = lrelu(norm(conv1d(h0, 128, k_w=4, name="conv1d_h1"), "bn1"))
-      h1 = tf.concat([h1, tf.tile(cond_, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2 = lrelu(norm(conv1d(h1, 256, k_w=4, name="conv1d_h2"), "bn2"))
-      h2 = tf.concat([h2, tf.tile(cond_, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3 = lrelu(norm(conv1d(h2, 512, k_w=4, name="conv1d_h3"), "bn3"))
-      h3 = tf.concat([h3, tf.tile(cond_, [1, int(h3.shape[1]), 1])], axis=-1)
-      logits = conv1d(h3, 1, k_w=4, name="logits", padding="VALID")
+      h0=lrelu(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h0")(x))
+      h1=lrelu(norm(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
+      h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
+      h2=lrelu(norm(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
+      h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
+      h3=lrelu(norm(tf.keras.layers.Conv1D(512, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
+      h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
+      logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
     elif self.d_arch == 2:
-      h0 = lrelu(conv1d(input_, 32, k_w=4, name="conv1d_h0"))
-      h1 = lrelu(norm(conv1d(h0, 64, k_w=4, name="conv1d_h1"), "bn1"))
-      h1 = tf.concat([h1, tf.tile(cond_, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2 = lrelu(norm(conv1d(h1, 128, k_w=4, name="conv1d_h2"), "bn2"))
-      h2 = tf.concat([h2, tf.tile(cond_, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3 = lrelu(norm(conv1d(h2, 256, k_w=4, name="conv1d_h3"), "bn3"))
-      h3 = tf.concat([h3, tf.tile(cond_, [1, int(h3.shape[1]), 1])], axis=-1)
-      logits = conv1d(h3, 1, k_w=4, name="logits", padding="VALID")
+      h0=lrelu(tf.keras.layers.Conv1D(32, 4, strides=2, padding='same', name="conv1d_h0")(x))
+      h1=lrelu(norm(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
+      h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
+      h2=lrelu(norm(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
+      h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
+      h3=lrelu(norm(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
+      h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
+      logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
     elif self.d_arch == 3:
-      h0 = lrelu(conv1d(input_, 16, k_w=4, name="conv1d_h0"))
-      h1 = lrelu(norm(conv1d(h0, 32, k_w=4, name="conv1d_h1"), "bn1"))
-      h1 = tf.concat([h1, tf.tile(cond_, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2 = lrelu(norm(conv1d(h1, 64, k_w=4, name="conv1d_h2"), "bn2"))
-      h2 = tf.concat([h2, tf.tile(cond_, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3 = lrelu(norm(conv1d(h2, 128, k_w=4, name="conv1d_h3"), "bn3"))
-      h3 = tf.concat([h3, tf.tile(cond_, [1, int(h3.shape[1]), 1])], axis=-1)
-      logits = conv1d(h3, 1, k_w=4, name="logits", padding="VALID")
+      h0=lrelu(tf.keras.layers.Conv1D(16, 4, strides=2, padding='same', name="conv1d_h0")(x))
+      h1=lrelu(norm(tf.keras.layers.Conv1D(32, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
+      h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
+      h2=lrelu(norm(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
+      h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
+      h3=lrelu(norm(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
+      h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
+      logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
     else:
       raise Exception("Unknown discriminator architecture!!!")
+    out=tf.reshape(logits, [self.batch_size, 1])
+    return tf.keras.Model(inputs=[x, cond, drop], outputs=out)
 
-    return tf.reshape(logits, [self.batch_size, 1])
-
-  def train(self, sess, realSeq_, realSkel_, seqA_, skelA_, seqB_, skelB_,
+  @tf.function
+  def train(self, realSeq_, realSkel_, seqA_, skelA_, seqB_, skelB_,
             aeReg_, mask_, step):
-    feed_dict = dict()
+    with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+      feed_dict = dict()
 
-    feed_dict[self.realSeq_] = realSeq_
-    feed_dict[self.realSkel_] = realSkel_
-    feed_dict[self.seqA_] = seqA_
-    feed_dict[self.skelA_] = skelA_
-    feed_dict[self.seqB_] = seqB_
-    feed_dict[self.skelB_] = skelB_
-    feed_dict[self.aeReg_] = aeReg_
-    feed_dict[self.mask_] = mask_
+      feed_dict[self.realSeq_] = realSeq_
+      feed_dict[self.realSkel_] = realSkel_
+      feed_dict[self.seqA_] = seqA_
+      feed_dict[self.skelA_] = skelA_
+      feed_dict[self.seqB_] = seqB_
+      feed_dict[self.skelB_] = skelB_
+      feed_dict[self.aeReg_] = aeReg_
+      feed_dict[self.mask_] = mask_
 
-    if self.fake_score > self.margin:
-      print("update D")
-      feed_dict[self.kp_] = 0.7
+      if self.fake_score > self.margin:
+        print("update D")
+        feed_dict[self.kp_] = 0.7
+        cur_score = self.D_.eval(feed_dict=feed_dict).mean()
+        self.fake_score = 0.99 * self.fake_score + 0.01 * cur_score
+        _, summary_str = sess.run([self.doptim, self.sum], feed_dict=feed_dict)
+
+      print("update G")
+      feed_dict[self.kp_] = 1.0
       cur_score = self.D_.eval(feed_dict=feed_dict).mean()
       self.fake_score = 0.99 * self.fake_score + 0.01 * cur_score
-      _, summary_str = sess.run([self.doptim, self.sum], feed_dict=feed_dict)
+      _, summary_str = sess.run([self.goptim, self.sum], feed_dict=feed_dict)
 
-    print("update G")
-    feed_dict[self.kp_] = 1.0
-    cur_score = self.D_.eval(feed_dict=feed_dict).mean()
-    self.fake_score = 0.99 * self.fake_score + 0.01 * cur_score
-    _, summary_str = sess.run([self.goptim, self.sum], feed_dict=feed_dict)
-
-    self.writer.add_summary(summary_str, step)
-    dlf, dlr, gl, lc = sess.run(
-        [self.L_disc_fake, self.L_disc_real, self.L_gen, self.overall_loss],
-        feed_dict=feed_dict)
+      self.writer.add_summary(summary_str, step)
+      dlf, dlr, gl, lc = sess.run(
+          [self.L_disc_fake, self.L_disc_real, self.L_gen, self.overall_loss],
+          feed_dict=feed_dict)
 
     return dlf, dlr, gl, lc
 
