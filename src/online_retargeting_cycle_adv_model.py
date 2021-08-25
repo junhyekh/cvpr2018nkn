@@ -65,305 +65,28 @@ class EncoderDecoderGRU(object):
     self.ostd=ostd
     self.parents=parents
 
-    self.realSeq_ = tf.placeholder(
-        tf.float32,
-        shape=[batch_size, max_len, 3 * n_joints + 4],
-        name="realSeq")
-    self.realSkel_ = tf.placeholder(
-        tf.float32, shape=[batch_size, max_len, 3 * n_joints], name="realSkel")
-    self.seqA_ = tf.placeholder(
-        tf.float32, shape=[batch_size, max_len, 3 * n_joints + 4], name="seqA")
-    self.seqB_ = tf.placeholder(
-        tf.float32, shape=[batch_size, max_len, 3 * n_joints + 4], name="seqB")
-    self.skelA_ = tf.placeholder(
-        tf.float32, shape=[batch_size, max_len, 3 * n_joints], name="skelA")
-    self.skelB_ = tf.placeholder(
-        tf.float32, shape=[batch_size, max_len, 3 * n_joints], name="skelB")
-    self.aeReg_ = tf.placeholder(
-        tf.float32, shape=[batch_size, 1], name="aeReg")
-    self.mask_ = tf.placeholder(
-        tf.float32, shape=[batch_size, max_len], name="mask")
-    self.kp_ = tf.placeholder(tf.float32, shape=[], name="kp")
+    self.gen=self.generator(layers_units)
+    self.disc=self.discriminator(tf.concat([tf.zeros(max_len, 3 * n_joints + 4)[:,:-4], (tf.zeros(max_len, 3 * n_joints + 4)[:,:-4])[:-1, :]],-1),tf.zeros((max_len, 3 * n_joints)))
 
-    self.enc_gru = self.gru_model(layers_units)
-    self.dec_gru = self.gru_model(layers_units)
-
-    b_local = []
-    b_global = []
-    b_quats = []
-    a_local = []
-    a_global = []
-    a_quats = []
-    reuse = False
-
-    statesA_AB = ()
-    statesB_AB = ()
-    statesA_BA = ()
-    statesB_BA = ()
-
-    for units in layers_units:
-      statesA_AB += (tf.zeros([batch_size, units]), )
-      statesB_AB += (tf.zeros([batch_size, units]), )
-      statesA_BA += (tf.zeros([batch_size, units]), )
-      statesB_BA += (tf.zeros([batch_size, units]), )
-
-    for t in range(max_len):
-      """Retarget A to B"""
-      with tf.variable_scope("Encoder", reuse=reuse):
-        ptA_in = self.seqA_[:, t, :]
-
-        _, statesA_AB = tf.contrib.rnn.static_rnn(
-            enc_gru, [ptA_in], initial_state=statesA_AB, dtype=tf.float32)
-
-      with tf.variable_scope("Decoder", reuse=reuse):
-        if t == 0:
-          ptB_in = tf.zeros([batch_size, 3 * n_joints + 4])
-        else:
-          ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
-
-        ptcombined = tf.concat(
-            values=[self.skelB_[:, 0, 3:], ptB_in, statesA_AB[-1]], axis=1)
-        _, statesB_AB = tf.contrib.rnn.static_rnn(
-            dec_gru, [ptcombined], initial_state=statesB_AB, dtype=tf.float32)
-        angles_n_offset = self.mlp_out(statesB_AB[-1])
-        output_angles = tf.reshape(angles_n_offset[:, :-4],
-                                   [batch_size, n_joints, 4])
-        b_global.append(angles_n_offset[:, -4:])
-        b_quats.append(self.normalized(output_angles))
-
-        skel_in = tf.reshape(self.skelB_[:, 0, :], [batch_size, n_joints, 3])
-        skel_in = skel_in * dstd + dmean
-
-        output = (self.fk.run(parents, skel_in, output_angles) - dmean) / dstd
-        output = tf.reshape(output, [batch_size, -1])
-        b_local.append(output)
-      """Retarget B back to A"""
-      with tf.variable_scope("Encoder", reuse=True):
-        ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
-
-        _, statesB_BA = tf.contrib.rnn.static_rnn(
-            enc_gru, [ptB_in], initial_state=statesB_BA, dtype=tf.float32)
-
-      with tf.variable_scope("Decoder", reuse=True):
-        if t == 0:
-          ptA_in = tf.zeros([batch_size, 3 * n_joints + 4])
-        else:
-          ptA_in = tf.concat([a_local[-1], a_global[-1]], axis=-1)
-
-        ptcombined = tf.concat(
-            values=[self.skelA_[:, 0, 3:], ptA_in, statesB_BA[-1]], axis=1)
-        _, statesA_BA = tf.contrib.rnn.static_rnn(
-            dec_gru, [ptcombined], initial_state=statesA_BA, dtype=tf.float32)
-        angles_n_offset = self.mlp_out(statesA_BA[-1])
-        output_angles = tf.reshape(angles_n_offset[:, :-4],
-                                   [batch_size, n_joints, 4])
-        a_global.append(angles_n_offset[:, -4:])
-        a_quats.append(self.normalized(output_angles))
-
-        skel_in = tf.reshape(self.skelA_[:, 0, :], [batch_size, n_joints, 3])
-        skel_in = skel_in * dstd + dmean
-
-        output = (self.fk.run(parents, skel_in, output_angles) - dmean) / dstd
-        output = tf.reshape(output, [batch_size, -1])
-        a_local.append(output)
-
-        reuse = True
-
-    self.localB = tf.stack(b_local, axis=1)
-    self.globalB = tf.stack(b_global, axis=1)
-    self.quatB = tf.stack(b_quats, axis=1)
-    self.localA = tf.stack(a_local, axis=1)
-    self.globalA = tf.stack(a_global, axis=1)
-    self.quatA = tf.stack(a_quats, axis=1)
-
-    if is_train:
-      dmean = dmean.reshape([1, 1, -1])
-      dstd = dstd.reshape([1, 1, -1])
-
-      with tf.variable_scope("DIS", reuse=False):
-        if self.d_rand:
-          dnorm_seq = self.realSeq_[:, :, :-4] * dstd + dmean
-          dnorm_off = self.realSeq_[:, :, -4:] * ostd + omean
-          skel_ = self.realSkel_[:, 0:1, 3:]
-        else:
-          dnorm_seq = self.seqA_[:, :, :-4] * dstd + dmean
-          dnorm_off = self.seqA_[:, :, -4:] * ostd + omean
-          skel_ = self.skelA_[:, 0:1, 3:]
-
-        diff_seq = dnorm_seq[:, 1:, :] - dnorm_seq[:, :-1, :]
-        real_data = tf.concat([diff_seq, dnorm_off[:, :-1, :]], axis=-1)
-        self.D_logits = self.discriminator(real_data, skel_)
-        self.D = tf.nn.sigmoid(self.D_logits)
-
-      self.seqB = tf.concat([self.localB, self.globalB], axis=-1)
-      with tf.variable_scope("DIS", reuse=True):
-        dnorm_seqB = self.seqB[:, :, :-4] * dstd + dmean
-        dnorm_offB = self.seqB[:, :, -4:] * ostd + omean
-        diff_seqB = dnorm_seqB[:, 1:, :] - dnorm_seqB[:, :-1, :]
-        fake_data = tf.concat([diff_seqB, dnorm_offB[:, :-1, :]], axis=-1)
-        self.D_logits_ = self.discriminator(fake_data, self.skelB_[:, 0:1, 3:])
-        self.D_ = tf.nn.sigmoid(self.D_logits_)
-      """ CYCLE OBJECTIVE """
-      output_localA = self.localA
-      target_seqA = self.seqA_[:, :, :-4]
-      self.cycle_local_loss = tf.reduce_sum(
-          tf.square(
-              tf.multiply(self.mask_[:, :, None],
-                          tf.subtract(output_localA, target_seqA))))
-      self.cycle_local_loss = tf.divide(self.cycle_local_loss,
-                                        tf.reduce_sum(self.mask_))
-
-      self.cycle_global_loss = tf.reduce_sum(
-          tf.square(
-              tf.multiply(self.mask_[:, :, None],
-                          tf.subtract(self.seqA_[:, :, -4:], self.globalA))))
-      self.cycle_global_loss = tf.divide(self.cycle_global_loss,
-                                         tf.reduce_sum(self.mask_))
-
-      dnorm_offA_ = self.globalA * ostd + omean
-      self.cycle_smooth = tf.reduce_sum(
-          tf.square(
-              tf.multiply(self.mask_[:, 1:, None],
-                          dnorm_offA_[:, 1:] - dnorm_offA_[:, :-1])))
-      self.cycle_smooth = tf.divide(self.cycle_smooth,
-                                    tf.reduce_sum(self.mask_))
-      """ INTERMEDIATE OBJECTIVE FOR REGULARIZATION """
-      output_localB = self.localB
-      target_seqB = self.seqB_[:, :, :-4]
-      self.interm_local_loss = tf.reduce_sum(
-          tf.square(
-              tf.multiply(self.aeReg_[:, :, None] * self.mask_[:, :, None],
-                          tf.subtract(output_localB, target_seqB))))
-      self.interm_local_loss = tf.divide(
-          self.interm_local_loss,
-          tf.maximum(tf.reduce_sum(self.aeReg_ * self.mask_), 1))
-
-      self.interm_global_loss = tf.reduce_sum(
-          tf.square(
-              tf.multiply(self.aeReg_[:, :, None] * self.mask_[:, :, None],
-                          tf.subtract(self.seqB_[:, :, -4:], self.globalB))))
-      self.interm_global_loss = tf.divide(
-          self.interm_global_loss,
-          tf.maximum(tf.reduce_sum(self.aeReg_ * self.mask_), 1))
-
-      dnorm_offB_ = self.globalB * ostd + omean
-      self.interm_smooth = tf.reduce_sum(
-          tf.square(
-              tf.multiply(self.mask_[:, 1:, None],
-                          dnorm_offB_[:, 1:] - dnorm_offB_[:, :-1])))
-      self.interm_smooth = tf.divide(self.interm_smooth,
-                                     tf.maximum(tf.reduce_sum(self.mask_), 1))
-
-      rads = self.alpha / 180.0
-      self.twist_loss1 = tf.reduce_mean(
-          tf.square(
-              tf.maximum(
-                  0.0,
-                  tf.abs(self.euler(self.quatB, euler_ord)) - rads * np.pi)))
-      self.twist_loss2 = tf.reduce_mean(
-          tf.square(
-              tf.maximum(
-                  0.0,
-                  tf.abs(self.euler(self.quatA, euler_ord)) - rads * np.pi)))
-      """Twist loss"""
-      self.twist_loss = 0.5 * (self.twist_loss1 + self.twist_loss2)
-      """Acceleration smoothness loss"""
-      self.smoothness = 0.5 * (self.interm_smooth + self.cycle_smooth)
-
-      self.overall_loss = (
-          self.cycle_local_loss + self.cycle_global_loss +
-          self.interm_local_loss + self.interm_global_loss +
-          self.gamma * self.twist_loss + self.omega * self.smoothness)
-
-      self.L_disc_real = tf.reduce_mean(
-          tf.nn.sigmoid_cross_entropy_with_logits(
-              logits=self.D_logits, labels=tf.ones_like(self.D_logits)))
-
-      self.L_disc_fake = tf.reduce_mean(
-          tf.nn.sigmoid_cross_entropy_with_logits(
-              logits=self.D_logits_, labels=tf.zeros_like(self.D_logits_)))
-
-      self.L_disc = self.L_disc_real + self.L_disc_fake
-
-      self.L_gen = tf.reduce_sum(
-          tf.multiply((1 - self.aeReg_),
-                      tf.nn.sigmoid_cross_entropy_with_logits(
-                          logits=self.D_logits_,
-                          labels=tf.ones_like(self.D_logits_))))
-      self.L_gen = tf.divide(self.L_gen,
-                             tf.maximum(tf.reduce_sum(1 - self.aeReg_), 1))
-
-      self.L = self.beta * self.L_gen + self.overall_loss
-
-      cycle_local_sum = tf.summary.scalar("losses/cycle_local_loss",
-                                          self.cycle_local_loss)
-      cycle_global_sum = tf.summary.scalar("losses/cycle_global_loss",
-                                           self.cycle_global_loss)
-      interm_local_sum = tf.summary.scalar("losses/interm_local_loss",
-                                           self.interm_local_loss)
-      interm_global_sum = tf.summary.scalar("losses/interm_global_loss",
-                                            self.interm_global_loss)
-      twist_sum = tf.summary.scalar("losses/twist_loss", self.twist_loss)
-      smooth_sum = tf.summary.scalar("losses/smoothness", self.smoothness)
-
-      Ldiscreal_sum = tf.summary.scalar("losses/disc_real", self.L_disc_real)
-      Ldiscfake_sum = tf.summary.scalar("losses/disc_fake", self.L_disc_fake)
-      Lgen_sum = tf.summary.scalar("losses/disc_gen", self.L_gen)
-
-      self.sum = tf.summary.merge([
-          cycle_local_sum, cycle_global_sum, interm_local_sum,
-          interm_global_sum, Lgen_sum, Ldiscreal_sum, Ldiscfake_sum, twist_sum,
-          smooth_sum
-      ])
-      self.writer = tf.summary.FileWriter(logs_dir, tf.get_default_graph())
-
-      self.allvars = tf.trainable_variables()
-      self.gvars = [v for v in self.allvars if "DIS" not in v.name]
-      self.dvars = [v for v in self.allvars if "DIS" in v.name]
-
-      if optim_name == "rmsprop":
-        goptimizer = tf.train.RMSPropOptimizer(
-            self.learning_rate, name="goptimizer")
-
-        doptimizer = tf.train.RMSPropOptimizer(
-            self.learning_rate, name="doptimizer")
-      elif optim_name == "adam":
-        goptimizer = tf.keras.optimizers.Adam(
+    self.goptimizer = tf.keras.optimizers.Adam(
             self.learning_rate, beta1=0.5, name="goptimizer")
 
-        doptimizer = tf.keras.optimizers.Adam(
+    self.doptimizer = tf.keras.optimizers.Adam(
             self.learning_rate, beta1=0.5, name="doptimizer")
-      else:
-        raise Exception("Unknown optimizer")
-
-      ggradients, gg = zip(
-          *goptimizer.compute_gradients(self.L, var_list=self.gvars))
-
-      dgradients, dg = zip(
-          *doptimizer.compute_gradients(self.L_disc, var_list=self.dvars))
-
-      ggradients, _ = tf.clip_by_global_norm(ggradients, 25)
-      dgradients, _ = tf.clip_by_global_norm(dgradients, 25)
-
-      self.goptim = goptimizer.apply_gradients(zip(ggradients, gg))
-      self.doptim = doptimizer.apply_gradients(zip(dgradients, dg))
-
-      num_param = 0
-      for var in self.gvars:
-        num_param += int(np.prod(var.get_shape()))
-      print("NUMBER OF G PARAMETERS: " + str(num_param))
-
-      num_param = 0
-      for var in self.dvars:
-        num_param += int(np.prod(var.get_shape()))
-      print("NUMBER OF D PARAMETERS: " + str(num_param))
-
+    self.writer  = tf.summary.create_file_writer(logs_dir)
+    
     self.saver = tf.train.Saver()
 
-  def generator(self, trainning=False):
+  def generator(self, layers_units):
+    enc_gru = self.gru_model(layers_units)
+    dec_gru = self.gru_model(layers_units)
+
     seqA_ = tf.keras.layers.Input(
         shape=(self.max_len, 3 * self.n_joints + 4),
         name="seqA")
+    skelA_ = tf.keras.layers.Input(
+        shape=(self.max_len, 3 * self.n_joints),
+        name="skelA_")
     skelB_ = tf.keras.layers.Input(
         shape=(self.max_len, 3 * self.n_joints),
         name="skelB")
@@ -374,96 +97,88 @@ class EncoderDecoderGRU(object):
     a_local = []
     a_global = []
     a_quats = []
-    reuse = False
 
     statesA_AB = ()
     statesB_AB = ()
     statesA_BA = ()
     statesB_BA = ()
     fc=tf.keras.layers.Dense(4 * (self.n_joints + 1))
-    for units in self.layers_units:
+    for units in layers_units:
       statesA_AB += (tf.zeros([self.batch_size, units]), )
       statesB_AB += (tf.zeros([self.batch_size, units]), )
       statesA_BA += (tf.zeros([self.batch_size, units]), )
       statesB_BA += (tf.zeros([self.batch_size, units]), )
 
     for t in range(self.max_len):
-      """Retarget A to B"""
-      with tf.variable_scope("Encoder", reuse=reuse):
-        ptA_in = seqA_[:, t, :]
+      """Retarget A to B"""       
+      ptA_in = seqA_[:, t, :]
 
-        _, statesA_AB = self.enc_gru([ptA_in], initial_state=statesA_AB)
-      with tf.variable_scope("Decoder", reuse=reuse):
-        if t == 0:
-          ptB_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
-        else:
-          ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
-
-        ptcombined = tf.concat(
-            values=[skelB_[:, 0, 3:], ptB_in, statesA_AB[-1]], axis=1)
-        _, statesB_AB = self.dec_gru([ptcombined], initial_state=statesB_AB)
-        angles_n_offset = fc(statesB_AB[-1])
-        output_angles = tf.reshape(angles_n_offset[:, :-4],
-                                   [self.batch_size, self.n_joints, 4])
-        b_global.append(angles_n_offset[:, -4:])
-        b_quats.append(self.normalized(output_angles))
-
-        skel_in = tf.reshape(self.skelB_[:, 0, :], [self.batch_size, self.n_joints, 3])
-        skel_in = skel_in * self.dstd + self.dmean
-
-        output = (self.fk.run(self.parents, skel_in, output_angles) - self.dmean) / self.dstd
-        output = tf.reshape(output, [self.batch_size, -1])
-        b_local.append(output)
-      """Retarget B back to A"""
-      with tf.variable_scope("Encoder", reuse=True):
+      _, statesA_AB = enc_gru([ptA_in, statesA_AB])
+      if t == 0:
+        ptB_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
+      else:
         ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
 
-        _, statesB_BA = self.enc_gru([ptB_in], initial_state=statesB_BA)
-
-      with tf.variable_scope("Decoder", reuse=True):
-        if t == 0:
-          ptA_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
-        else:
-          ptA_in = tf.concat([a_local[-1], a_global[-1]], axis=-1)
-
-        ptcombined = tf.concat(
-            values=[self.skelA_[:, 0, 3:], ptA_in, statesB_BA[-1]], axis=1)
-        _, statesA_BA = self.dec_gru([ptcombined], initial_state=statesA_BA)
-        angles_n_offset = fc(statesA_BA[-1])
-        output_angles = tf.reshape(angles_n_offset[:, :-4],
+      ptcombined = tf.concat(
+          values=[skelB_[:, 0, 3:], ptB_in, statesA_AB[-1]], axis=1)
+      _, statesB_AB = dec_gru([ptcombined, statesB_AB])
+      angles_n_offset = fc(statesB_AB[-1])
+      output_angles = tf.reshape(angles_n_offset[:, :-4],
                                   [self.batch_size, self.n_joints, 4])
-        a_global.append(angles_n_offset[:, -4:])
-        a_quats.append(self.normalized(output_angles))
+      b_global.append(angles_n_offset[:, -4:])
+      b_quats.append(self.normalized(output_angles))
 
-        skel_in = tf.reshape(self.skelA_[:, 0, :], [self.batch_size, self.n_joints, 3])
-        skel_in = skel_in * self.dstd + self.dmean
+      skel_in = tf.reshape(skelB_[:, 0, :], [self.batch_size, self.n_joints, 3])
+      skel_in = skel_in * self.dstd + self.dmean
 
-        output = (self.fk.run(self.parents, skel_in, output_angles) - self.dmean) / self.dstd
-        output = tf.reshape(output, [self.batch_size, -1])
-        a_local.append(output)
+      output = (self.fk.run(self.parents, skel_in, output_angles) - self.dmean) / self.dstd
+      output = tf.reshape(output, [self.batch_size, -1])
+      b_local.append(output)
+      """Retarget B back to A"""
+      ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
 
-        reuse = True
-      return tf.keras.Model(inputs=[seqA_, skelB_], outputs=[b_local, b_global, b_quats, a_local, a_global, a_quats]) 
+      _, statesB_BA = enc_gru([ptB_in, statesB_BA])
+
+      if t == 0:
+        ptA_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
+      else:
+        ptA_in = tf.concat([a_local[-1], a_global[-1]], axis=-1)
+
+      ptcombined = tf.concat(
+          values=[skelA_[:, 0, 3:], ptA_in, statesB_BA[-1]], axis=1)
+      _, statesA_BA = dec_gru([ptcombined, statesA_BA])
+      angles_n_offset = fc(statesA_BA[-1])
+      output_angles = tf.reshape(angles_n_offset[:, :-4],
+                                [self.batch_size, self.n_joints, 4])
+      a_global.append(angles_n_offset[:, -4:])
+      a_quats.append(self.normalized(output_angles))
+
+      skel_in = tf.reshape(skelA_[:, 0, :], [self.batch_size, self.n_joints, 3])
+      skel_in = skel_in * self.dstd + self.dmean
+
+      output = (self.fk.run(self.parents, skel_in, output_angles) - self.dmean) / self.dstd
+      output = tf.reshape(output, [self.batch_size, -1])
+      a_local.append(output)
+
+      return tf.keras.Model(inputs=[seqA_, skelA_, skelB_], outputs=[b_local, b_global, b_quats, a_local, a_global, a_quats]) 
 
   # def mlp_out(self, input_, reuse=False, name="mlp_out"):
   #   out = qlinear(input_, 4 * (self.n_joints + 1), name="dec_fc")
   #   return out
 
   def gru_model(self, layers_units, rnn_type="GRU"):
-    gru_cells = [tf.keras.layers.GRUCell(units, dropout=self.kp) for units in layers_units]
+    gru_cells = [tf.keras.layers.GRUCell(units, dropout=(1-self.kp)) for units in layers_units]
     gru_layer=tf.keras.layers.RNN(gru_cells, return_state=True)
     return gru_layer
 
   def discriminator(self, input_, cond_):
     x=tf.keras.layers.Input(shape=input_.get_shape())
     cond=tf.keras.layers.Input(shape=cond_.get_shape())
-    drop=tf.keras.Input(shape=(1,))
+    drop=tf.keras.layers.Input(shape=(1,))
     norm=tf.keras.layers.BatchNormalization()
     lrelu=tf.keras.layers.LeakyReLU()
-    if drop==1:
-      x=tf.keras.layers.Dropout(0.7)(x)
-    else:
-      x=tf.keras.layers.Dropout(1.0)(x)
+    if drop>0:
+      x=tf.keras.layers.Dropout(0.3)(x)
     if self.d_arch == 0:
       h0=lrelu(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h0")(x))
       h1=lrelu(norm(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
@@ -505,56 +220,188 @@ class EncoderDecoderGRU(object):
     out=tf.reshape(logits, [self.batch_size, 1])
     return tf.keras.Model(inputs=[x, cond, drop], outputs=out)
 
+  def cyc_loss(self, seqA_, seqB_, mask_):
+    output_localA = self.localA
+    target_seqA = seqA_[:, :, :-4]
+    cycle_local_loss = tf.reduce_sum(
+        tf.square(
+            tf.multiply(mask_[:, :, None],
+                        tf.subtract(output_localA, target_seqA))))
+    cycle_local_loss = tf.divide(cycle_local_loss,
+                                      tf.reduce_sum(mask_))
+
+    cycle_global_loss = tf.reduce_sum(
+        tf.square(
+            tf.multiply(mask_[:, :, None],
+                        tf.subtract(seqA_[:, :, -4:], self.globalA))))
+    cycle_global_loss = tf.divide(cycle_global_loss,
+                                        tf.reduce_sum(mask_))
+
+    dnorm_offA_ = self.globalA * self.ostd + self.omean
+    cycle_smooth = tf.reduce_sum(
+        tf.square(
+            tf.multiply(mask_[:, 1:, None],
+                        dnorm_offA_[:, 1:] - dnorm_offA_[:, :-1])))
+    cycle_smooth = tf.divide(cycle_smooth,
+                                  tf.reduce_sum(mask_))
+    """ INTERMEDIATE OBJECTIVE FOR REGULARIZATION """
+    output_localB = self.localB
+    target_seqB = seqB_[:, :, :-4]
+    interm_local_loss = tf.reduce_sum(
+        tf.square(
+            tf.multiply(self.aeReg_[:, :, None] * mask_[:, :, None],
+                        tf.subtract(output_localB, target_seqB))))
+    interm_local_loss = tf.divide(
+        interm_local_loss,
+        tf.maximum(tf.reduce_sum(self.aeReg_ * mask_), 1))
+
+    interm_global_loss = tf.reduce_sum(
+        tf.square(
+            tf.multiply(self.aeReg_[:, :, None] * mask_[:, :, None],
+                        tf.subtract(seqB_[:, :, -4:], self.globalB))))
+    interm_global_loss = tf.divide(
+        interm_global_loss,
+        tf.maximum(tf.reduce_sum(self.aeReg_ * mask_), 1))
+
+    dnorm_offB_ = self.globalB * self.ostd + self.omean
+    interm_smooth = tf.reduce_sum(
+        tf.square(
+            tf.multiply(mask_[:, 1:, None],
+                        dnorm_offB_[:, 1:] - dnorm_offB_[:, :-1])))
+    interm_smooth = tf.divide(interm_smooth,
+                                    tf.maximum(tf.reduce_sum(mask_), 1))
+    return cycle_local_loss, cycle_global_loss, interm_local_loss, interm_global_loss, cycle_smooth, interm_smooth 
+  
+  def twist_loss(self):
+    rads = self.alpha / 180.0
+    twist_loss1 = tf.reduce_mean(
+        tf.square(
+            tf.maximum(
+                0.0,
+                tf.abs(self.euler(self.quatB, self.euler_ord)) - rads * np.pi)))
+    twist_loss2 = tf.reduce_mean(
+        tf.square(
+            tf.maximum(
+                0.0,
+                tf.abs(self.euler(self.quatA, self.euler_ord)) - rads * np.pi)))
+    """Twist loss"""
+    return 0.5 * (twist_loss1 + twist_loss2)
+  
+  def disc_loss(self, real_logits, fake_logits):
+    L_disc_real = tf.reduce_mean(
+          tf.nn.sigmoid_cross_entropy_with_logits(
+              logits=real_logits, labels=tf.ones_like(real_logits)))
+
+    L_disc_fake = tf.reduce_mean(
+        tf.nn.sigmoid_cross_entropy_with_logits(
+            logits=fake_logits, labels=tf.zeros_like(fake_logits)))
+
+    return L_disc_real, L_disc_fake
+
+  def gen_loss(self, fake_logits):
+    L_gen = tf.reduce_sum(
+          tf.multiply((1 - self.aeReg_),
+                      tf.nn.sigmoid_cross_entropy_with_logits(
+                          logits=fake_logits,
+                          labels=tf.ones_like(fake_logits))))
+    L_gen = tf.divide(L_gen,
+                            tf.maximum(tf.reduce_sum(1 - self.aeReg_), 1))
+
+    return L_gen
+
   @tf.function
-  def train(self, realSeq_, realSkel_, seqA_, skelA_, seqB_, skelB_,
-            aeReg_, mask_, step):
+  def train(self, realSeq_, realSkel_, seqA_, skelA_, seqB_, skelB_, mask_,
+            step):
     with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
-      feed_dict = dict()
+      mask_=tf.convert_to_tensor(mask_)
+      b_local, b_global, b_quats, a_local, a_global, a_quats=self.gen(seqA_, skelA_, skelB_)
+      self.localB = tf.stack(b_local, axis=1)
+      self.globalB = tf.stack(b_global, axis=1)
+      self.quatB = tf.stack(b_quats, axis=1)
+      self.localA = tf.stack(a_local, axis=1)
+      self.globalA = tf.stack(a_global, axis=1)
+      self.quatA = tf.stack(a_quats, axis=1)
+      dmean = self.dmean.reshape([1, 1, -1])
+      dstd = self.dstd.reshape([1, 1, -1])
 
-      feed_dict[self.realSeq_] = realSeq_
-      feed_dict[self.realSkel_] = realSkel_
-      feed_dict[self.seqA_] = seqA_
-      feed_dict[self.skelA_] = skelA_
-      feed_dict[self.seqB_] = seqB_
-      feed_dict[self.skelB_] = skelB_
-      feed_dict[self.aeReg_] = aeReg_
-      feed_dict[self.mask_] = mask_
+      if self.d_rand:
+        dnorm_seq = realSeq_[:, :, :-4] * dstd + dmean
+        dnorm_off = realSeq_[:, :, -4:] * self.ostd + self.omean
+        skel_ = realSkel_[:, 0:1, 3:]
+      else:
+        dnorm_seq = seqA_[:, :, :-4] * dstd + dmean
+        dnorm_off = seqA_[:, :, -4:] * self.ostd + self.omean
+        skel_ = skelA_[:, 0:1, 3:]
 
+      diff_seq = dnorm_seq[:, 1:, :] - dnorm_seq[:, :-1, :]
+      real_data = tf.concat([diff_seq, dnorm_off[:, :-1, :]], axis=-1)
+      real_logits = self.disc([real_data, skel_, 1])
+      real_out = tf.sigmoid(real_logits)
+      seqB = tf.concat([self.localB, self.globalB], axis=-1)
+      dnorm_seqB = seqB[:, :, :-4] * dstd + dmean
+      dnorm_offB = seqB[:, :, -4:] * self.ostd + self.omean
+      diff_seqB = dnorm_seqB[:, 1:, :] - dnorm_seqB[:, :-1, :]
+      fake_data = tf.concat([diff_seqB, dnorm_offB[:, :-1, :]], axis=-1)
       if self.fake_score > self.margin:
         print("update D")
-        feed_dict[self.kp_] = 0.7
-        cur_score = self.D_.eval(feed_dict=feed_dict).mean()
+        fake_logits = self.disc([fake_data, skelB_[:, 0:1, 3:],1])
+        fake_out = tf.sigmoid(fake_logits)
+        cur_score=fake_out.mean()
+        #cur_score = self.D_.eval(feed_dict=feed_dict).mean()
         self.fake_score = 0.99 * self.fake_score + 0.01 * cur_score
-        _, summary_str = sess.run([self.doptim, self.sum], feed_dict=feed_dict)
+        self.L_disc_real, self.L_disc_fake=self.disc_loss(real_logits, fake_logits)
+        d_loss=self.L_disc_real +self.L_disc_fake
+        discriminator_gradients=disc_tape.gradient(d_loss, self.disc.trainable_variables)
+        self.doptimizer.apply_gradients(zip(discriminator_gradients, self.disc.trainable_variables))
+        
 
       print("update G")
-      feed_dict[self.kp_] = 1.0
-      cur_score = self.D_.eval(feed_dict=feed_dict).mean()
+      fake_logits_g=self.disc([fake_data, skelB_[:, 0:1, 3:],0])
+      fake_out_g=tf.sigmoid(fake_logits_g)
+      cur_score =fake_out_g.mean()
       self.fake_score = 0.99 * self.fake_score + 0.01 * cur_score
-      _, summary_str = sess.run([self.goptim, self.sum], feed_dict=feed_dict)
 
-      self.writer.add_summary(summary_str, step)
-      dlf, dlr, gl, lc = sess.run(
-          [self.L_disc_fake, self.L_disc_real, self.L_gen, self.overall_loss],
-          feed_dict=feed_dict)
+      cycle_local_loss, cycle_global_loss, interm_local_loss, interm_global_loss, cycle_smooth, interm_smooth = self.cyc_loss(seqA_, seqB_, mask_)
+      twist_loss=self.twist_loss()
+      smoothness = 0.5 * (interm_smooth + cycle_smooth)
+      overall_loss = (
+          cycle_local_loss + cycle_global_loss +
+          interm_local_loss + interm_global_loss +
+          self.gamma * twist_loss + self.omega * smoothness)
+      L_gen=self.gen_loss(fake_logits_g)
+      L = self.beta * L_gen + overall_loss
+      generator_gradients=disc_tape.gradient(L, self.gen.trainable_variables)
+      self.goptimizer.apply_gradients(zip(generator_gradients, self.gen.trainable_variables))
+      with self.writer.as_default():
+        tf.summary.scalar("losses/cycle_local_loss",
+                                            cycle_local_loss, step)
+        tf.summary.scalar("losses/cycle_global_loss",
+                                            cycle_global_loss, step)
+        tf.summary.scalar("losses/interm_local_loss",
+                                            interm_local_loss, step)
+        tf.summary.scalar("losses/interm_global_loss",
+                                              interm_global_loss, step)
+        tf.summary.scalar("losses/twist_loss", twist_loss, step)
+        tf.summary.scalar("losses/smoothness", smoothness, step)
 
-    return dlf, dlr, gl, lc
+        tf.summary.scalar("losses/disc_real", self.L_disc_real, step)
+        tf.summary.scalar("losses/disc_fake", self.L_disc_fake, step)
+        tf.summary.scalar("losses/disc_gen", L_gen, step)
 
-  def predict(self, sess, seqA_, skelB_, mask_):
-    feed_dict = dict()
-    feed_dict[self.seqA_] = seqA_
-    feed_dict[self.skelB_] = skelB_
-    feed_dict[self.mask_] = mask_
-    SL = self.localB.eval(feed_dict=feed_dict)
-    SG = self.globalB.eval(feed_dict=feed_dict)
-    output = np.concatenate((SL, SG), axis=-1)
-    quats = self.quatB.eval(feed_dict=feed_dict)
-    return output, quats
+    return self.L_disc_fake, self.L_disc_real, L_gen, overall_loss
 
+  def predict(self, seqA_, skelA_, skelB_):
+    
+    b_local, b_global, b_quats, _, _, _=self.gen(seqA_, skelA_, skelB_)
+    output = np.concatenate((b_local, b_global), axis=-1)
+    return output, b_quats
+
+  @tf.function
   def normalized(self, angles):
-    lengths = tf.sqrt(tf.reduce_sum(tf.square(angles), axis=-1))
+    lengths = tf.math.sqrt(tf.math.reduce_sum(tf.math.square(angles), axis=-1))
     return angles / lengths[..., None]
-
+    
+  @tf.function
   def euler(self, angles, order="yzx"):
     q = self.normalized(angles)
     q0 = q[..., 0]
@@ -577,23 +424,20 @@ class EncoderDecoderGRU(object):
     else:
       raise Exception("Unknown Euler order!")
 
-  def save(self, sess, checkpoint_dir, step):
-    model_name = "EncoderDecoderGRU.model"
-
+  def save(self, checkpoint_dir, step):
+    disc_name = "discriminator.model-"+str(step)+".h5"
+    gen_name = " generator.model-"+str(step)+".h5"
     if not os.path.exists(checkpoint_dir):
       os.makedirs(checkpoint_dir)
 
-    self.saver.save(
-        sess, os.path.join(checkpoint_dir, model_name), global_step=step)
+    self.disc.save(os.path.join(checkpoint_dir, disc_name))
+    self.gen.save(os.path.join(checkpoint_dir, gen_name))
 
-  def load(self, sess, checkpoint_dir, model_name=None):
+  def load(self, checkpoint_dir, disc_name=None, gen_name=None):
     print("[*] Reading checkpoints...")
-    ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
-    if ckpt and ckpt.model_checkpoint_path:
-      ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
-      if model_name is None: model_name = ckpt_name
-      self.saver.restore(sess, os.path.join(checkpoint_dir, model_name))
-      print("     Loaded model: " + str(model_name))
-      return True, model_name
-    else:
-      return False, None
+    try:
+      self.gen=tf.keras.models.load_model(os.path.join(checkpoint_dir, gen_name))
+      self.disc=tf.keras.models.load_model(os.path.join(checkpoint_dir, disc_name))
+      return True
+    except:
+      return False

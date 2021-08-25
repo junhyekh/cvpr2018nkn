@@ -22,11 +22,11 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
          euler_ord, max_steps, min_steps, num_layer, gru_units, optim,
-         norm_type, mem_frac, keep_prob, learning_rate):
+         norm_type, mem_frac, keep_prob, learning_rate, start_step):
 
   prefix = "Online_Retargeting_Mixamo_Cycle_Adv"
 
-  for kk, vv in locals().iteritems():
+  for kk, vv in locals().items():
     if (kk != "prefix" and kk != "mem_frac" and kk != "batch_size"
         and kk != "min_steps" and kk != "max_steps" and kk != "gpu"):
       prefix += "_" + kk + "=" + str(vv)
@@ -98,7 +98,7 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
       -1, 0, 1, 2, 3, 4, 0, 6, 7, 8, 0, 10, 11, 12, 3, 14, 15, 16, 3, 18, 19,
       20
   ])
-  with tf.device("/gpu:%d" % gpu):
+  with tf.device("/gpu:0"):
     gru = EncoderDecoderGRU(batch_size, alpha, beta, gamma, omega, euler_ord,
                             n_joints, layers_units, max_steps, local_mean,
                             local_std, global_mean, global_std, parents,
@@ -110,26 +110,18 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
 
   if not exists(logs_dir):
     makedirs(logs_dir)
-
-  gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=mem_frac)
-  with tf.Session(
-      config=tf.ConfigProto(
-          allow_soft_placement=True,
-          log_device_placement=False,
-          gpu_options=gpu_options)) as sess:
-
-    sess.run(tf.global_variables_initializer())
-
-    loaded, model_name = gru.load(sess, models_dir)
+    disc_name="discriminator.model-"+str(start_step)+".h5"
+    gen_name="generator.model-"+str(start_step)+".h5"
+    loaded = gru.load(models_dir, disc_name, gen_name)
     if loaded:
       print("[*] Load SUCCESSFUL")
-      step = int(model_name.split("-")[-1])
+      step = start_step
     else:
       print("[!] Starting from scratch ...")
       step = 0
 
     total_steps = 50000
-    gru.saver = tf.train.Saver(max_to_keep=10)
+    
     while step < total_steps:
       mini_batches = get_minibatches_idx(
           len(trainlocal), batch_size, shuffle=True)
@@ -249,7 +241,7 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
           mid_time = time.time()
 
           dlf, dlr, gl, lc = gru.train(
-              sess, realSeq_batch, realSkel_batch, seqA_batch, skelA_batch,
+              realSeq_batch, realSkel_batch, seqA_batch, skelA_batch,
               seqB_batch, skelB_batch, aeReg_batch, mask_batch, step)
 
           print("step=%d/%d,  g_loss=%.5f, d_loss=%.5f, cyc_loss=%.5f, "
@@ -261,11 +253,11 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
             return
 
           if step >= 1000 and step % 1000 == 0:
-            gru.save(sess, models_dir, step)
+            gru.save(models_dir, step)
 
           step = step + 1
 
-    gru.save(sess, models_dir, step)
+    gru.save(models_dir, step)
 
 
 if __name__ == "__main__":
@@ -379,5 +371,12 @@ if __name__ == "__main__":
       dest="learning_rate",
       required=False,
       help="Keep probability for dropout")
+  parser.add_argument(
+      "--start_step",
+      type=int,
+      default=0,
+      dest="start_step",
+      required=False,
+      help="step to start with")
   args = parser.parse_args()
   main(**vars(args))
