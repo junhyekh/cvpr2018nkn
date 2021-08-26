@@ -24,6 +24,15 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
          euler_ord, max_steps, min_steps, num_layer, gru_units, optim,
          norm_type, mem_frac, keep_prob, learning_rate, start_step):
 
+  gpus = tf.config.experimental.list_physical_devices('GPU') 
+  if gpus: 
+    try: # Currently, memory growth needs to be the same across GPUs 
+      for gpu in gpus: tf.config.experimental.set_memory_growth(gpu, True) 
+      logical_gpus = tf.config.experimental.list_logical_devices('GPU') 
+      print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs") 
+    except RuntimeError as e: # Memory growth must be set before GPUs have been initialized 
+      print(e)
+
   prefix = "Online_Retargeting_Mixamo_Cycle_Adv"
 
   for kk, vv in locals().items():
@@ -85,7 +94,7 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
   np.save(data_path[:-6] + "mixamo_global_motion_std.npy", global_std)
 
   n_joints = alllocal[0].shape[-2]
-
+  print(n_joints)
   for i in range(len(trainlocal)):
     trainlocal[i] = (trainlocal[i] - local_mean) / local_std
     trainglobal[i] = (trainglobal[i] - global_mean) / global_std
@@ -104,7 +113,7 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
                             local_std, global_mean, global_std, parents,
                             keep_prob, logs_dir, learning_rate, optim, margin,
                             d_arch, d_rand, norm_type)
-
+  print("making gru done")
   if not exists(models_dir):
     makedirs(models_dir)
 

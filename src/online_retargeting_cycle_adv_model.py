@@ -58,6 +58,7 @@ class EncoderDecoderGRU(object):
     self.margin = margin
     self.fake_score = 0.5
     self.norm_type = norm_type
+    
     self.layers_units=layers_units
     self.dstd=dstd
     self.dmean=dmean
@@ -66,29 +67,30 @@ class EncoderDecoderGRU(object):
     self.parents=parents
 
     self.gen=self.generator(layers_units)
-    self.disc=self.discriminator(tf.concat([tf.zeros(max_len, 3 * n_joints + 4)[:,:-4], (tf.zeros(max_len, 3 * n_joints + 4)[:,:-4])[:-1, :]],-1),tf.zeros((max_len, 3 * n_joints)))
+    self.disc=self.discriminator(tf.concat([tf.zeros((max_len, 3 * n_joints + 4))[:,:-4][1:, :], (tf.zeros((max_len, 3 * n_joints + 4))[:,-4:])[:-1, :]],-1),tf.zeros((max_len, 3 * n_joints))[0:1, 3:])
 
     self.goptimizer = tf.keras.optimizers.Adam(
-            self.learning_rate, beta1=0.5, name="goptimizer")
+            self.learning_rate, beta_1=0.5, name="goptimizer")
 
     self.doptimizer = tf.keras.optimizers.Adam(
-            self.learning_rate, beta1=0.5, name="doptimizer")
+            self.learning_rate, beta_1=0.5, name="doptimizer")
     self.writer  = tf.summary.create_file_writer(logs_dir)
     
-    self.saver = tf.train.Saver()
-
   def generator(self, layers_units):
     enc_gru = self.gru_model(layers_units)
     dec_gru = self.gru_model(layers_units)
 
-    seqA_ = tf.keras.layers.Input(
+    seqA_ = tf.keras.Input(
         shape=(self.max_len, 3 * self.n_joints + 4),
+        batch_size=self.batch_size,
         name="seqA")
-    skelA_ = tf.keras.layers.Input(
+    skelA_ = tf.keras.Input(
         shape=(self.max_len, 3 * self.n_joints),
+        batch_size=self.batch_size,
         name="skelA_")
-    skelB_ = tf.keras.layers.Input(
+    skelB_ = tf.keras.Input(
         shape=(self.max_len, 3 * self.n_joints),
+        batch_size=self.batch_size,
         name="skelB")
 
     b_local = []
@@ -98,22 +100,22 @@ class EncoderDecoderGRU(object):
     a_global = []
     a_quats = []
 
-    statesA_AB = ()
-    statesB_AB = ()
-    statesA_BA = ()
-    statesB_BA = ()
+    statesA_AB = []
+    statesB_AB = []
+    statesA_BA = []
+    statesB_BA = []
     fc=tf.keras.layers.Dense(4 * (self.n_joints + 1))
     for units in layers_units:
-      statesA_AB += (tf.zeros([self.batch_size, units]), )
-      statesB_AB += (tf.zeros([self.batch_size, units]), )
-      statesA_BA += (tf.zeros([self.batch_size, units]), )
-      statesB_BA += (tf.zeros([self.batch_size, units]), )
-
+      statesA_AB += [tf.zeros([self.batch_size, units])]
+      statesB_AB += [tf.zeros([self.batch_size, units])]
+      statesA_BA += [tf.zeros([self.batch_size, units])]
+      statesB_BA += [tf.zeros([self.batch_size, units])]
     for t in range(self.max_len):
       """Retarget A to B"""       
       ptA_in = seqA_[:, t, :]
 
-      _, statesA_AB = enc_gru([ptA_in, statesA_AB])
+      n = enc_gru(tf.expand_dims(ptA_in, 1), initial_state=statesA_AB)
+      statesA_AB=n[1:]
       if t == 0:
         ptB_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
       else:
@@ -121,7 +123,8 @@ class EncoderDecoderGRU(object):
 
       ptcombined = tf.concat(
           values=[skelB_[:, 0, 3:], ptB_in, statesA_AB[-1]], axis=1)
-      _, statesB_AB = dec_gru([ptcombined, statesB_AB])
+      n = dec_gru(tf.expand_dims(ptcombined, 1), initial_state=statesB_AB)
+      statesB_AB=n[1:]
       angles_n_offset = fc(statesB_AB[-1])
       output_angles = tf.reshape(angles_n_offset[:, :-4],
                                   [self.batch_size, self.n_joints, 4])
@@ -137,7 +140,8 @@ class EncoderDecoderGRU(object):
       """Retarget B back to A"""
       ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
 
-      _, statesB_BA = enc_gru([ptB_in, statesB_BA])
+      n= enc_gru(tf.expand_dims(ptB_in, 1), initial_state=statesB_BA)
+      statesB_BA=n[1:]
 
       if t == 0:
         ptA_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
@@ -146,7 +150,8 @@ class EncoderDecoderGRU(object):
 
       ptcombined = tf.concat(
           values=[skelA_[:, 0, 3:], ptA_in, statesB_BA[-1]], axis=1)
-      _, statesA_BA = dec_gru([ptcombined, statesA_BA])
+      n = dec_gru(tf.expand_dims(ptcombined, 1), initial_state=statesA_BA)
+      statesA_BA=n[1:]
       angles_n_offset = fc(statesA_BA[-1])
       output_angles = tf.reshape(angles_n_offset[:, :-4],
                                 [self.batch_size, self.n_joints, 4])
@@ -172,53 +177,58 @@ class EncoderDecoderGRU(object):
     return gru_layer
 
   def discriminator(self, input_, cond_):
-    x=tf.keras.layers.Input(shape=input_.get_shape())
-    cond=tf.keras.layers.Input(shape=cond_.get_shape())
-    drop=tf.keras.layers.Input(shape=(1,))
-    norm=tf.keras.layers.BatchNormalization()
+    print(input_.get_shape(), cond_.get_shape())
+    x=tf.keras.Input(shape=input_.get_shape())
+    cond=tf.keras.Input(shape=cond_.get_shape())
+    norm1=tf.keras.layers.BatchNormalization()
+    norm2=tf.keras.layers.BatchNormalization()
+    norm3=tf.keras.layers.BatchNormalization()
     lrelu=tf.keras.layers.LeakyReLU()
-    if drop>0:
-      x=tf.keras.layers.Dropout(0.3)(x)
+    lrelu1=tf.keras.layers.LeakyReLU()
+    lrelu2=tf.keras.layers.LeakyReLU()
+    lrelu3=tf.keras.layers.LeakyReLU()
+    #x= tf.cond(tf.greater(drop, 0), lambda: tf.keras.layers.Dropout(0.3)(x), lambda: x)
+    #x=tf.nn.dropout(x, rate=0.3)
     if self.d_arch == 0:
       h0=lrelu(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h0")(x))
-      h1=lrelu(norm(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
+      h1=lrelu1(norm1(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
       h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2=lrelu(norm(tf.keras.layers.Conv1D(512, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
+      h2=lrelu2(norm2(tf.keras.layers.Conv1D(512, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
       h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3=lrelu(norm(tf.keras.layers.Conv1D(1024, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
+      h3=lrelu3(norm3(tf.keras.layers.Conv1D(1024, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
       h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
       logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
     elif self.d_arch == 1:
       h0=lrelu(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h0")(x))
-      h1=lrelu(norm(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
+      h1=lrelu1(norm1(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
       h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2=lrelu(norm(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
+      h2=lrelu2(norm2(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
       h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3=lrelu(norm(tf.keras.layers.Conv1D(512, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
+      h3=lrelu3(norm3(tf.keras.layers.Conv1D(512, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
       h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
       logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
     elif self.d_arch == 2:
       h0=lrelu(tf.keras.layers.Conv1D(32, 4, strides=2, padding='same', name="conv1d_h0")(x))
-      h1=lrelu(norm(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
+      h1=lrelu1(norm1(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
       h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2=lrelu(norm(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
+      h2=lrelu2(norm2(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
       h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3=lrelu(norm(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
+      h3=lrelu3(norm3(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
       h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
       logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
     elif self.d_arch == 3:
       h0=lrelu(tf.keras.layers.Conv1D(16, 4, strides=2, padding='same', name="conv1d_h0")(x))
-      h1=lrelu(norm(tf.keras.layers.Conv1D(32, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
+      h1=lrelu(norm1(tf.keras.layers.Conv1D(32, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
       h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2=lrelu(norm(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
+      h2=lrelu(norm2(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
       h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3=lrelu(norm(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
+      h3=lrelu(norm3(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
       h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
       logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
     else:
       raise Exception("Unknown discriminator architecture!!!")
     out=tf.reshape(logits, [self.batch_size, 1])
-    return tf.keras.Model(inputs=[x, cond, drop], outputs=out)
+    return tf.keras.Model(inputs=[x, cond], outputs=out)
 
   def cyc_loss(self, seqA_, seqB_, mask_):
     output_localA = self.localA
@@ -335,7 +345,7 @@ class EncoderDecoderGRU(object):
 
       diff_seq = dnorm_seq[:, 1:, :] - dnorm_seq[:, :-1, :]
       real_data = tf.concat([diff_seq, dnorm_off[:, :-1, :]], axis=-1)
-      real_logits = self.disc([real_data, skel_, 1])
+      real_logits = self.disc(real_data, skel_)
       real_out = tf.sigmoid(real_logits)
       seqB = tf.concat([self.localB, self.globalB], axis=-1)
       dnorm_seqB = seqB[:, :, :-4] * dstd + dmean
@@ -344,7 +354,7 @@ class EncoderDecoderGRU(object):
       fake_data = tf.concat([diff_seqB, dnorm_offB[:, :-1, :]], axis=-1)
       if self.fake_score > self.margin:
         print("update D")
-        fake_logits = self.disc([fake_data, skelB_[:, 0:1, 3:],1])
+        fake_logits = self.disc(fake_data, skelB_[:, 0:1, 3:])
         fake_out = tf.sigmoid(fake_logits)
         cur_score=fake_out.mean()
         #cur_score = self.D_.eval(feed_dict=feed_dict).mean()
@@ -356,7 +366,7 @@ class EncoderDecoderGRU(object):
         
 
       print("update G")
-      fake_logits_g=self.disc([fake_data, skelB_[:, 0:1, 3:],0])
+      fake_logits_g=self.disc(fake_data, skelB_[:, 0:1, 3:])
       fake_out_g=tf.sigmoid(fake_logits_g)
       cur_score =fake_out_g.mean()
       self.fake_score = 0.99 * self.fake_score + 0.01 * cur_score
@@ -370,7 +380,7 @@ class EncoderDecoderGRU(object):
           self.gamma * twist_loss + self.omega * smoothness)
       L_gen=self.gen_loss(fake_logits_g)
       L = self.beta * L_gen + overall_loss
-      generator_gradients=disc_tape.gradient(L, self.gen.trainable_variables)
+      generator_gradients=gen_tape.gradient(L, self.gen.trainable_variables)
       self.goptimizer.apply_gradients(zip(generator_gradients, self.gen.trainable_variables))
       with self.writer.as_default():
         tf.summary.scalar("losses/cycle_local_loss",
@@ -396,9 +406,8 @@ class EncoderDecoderGRU(object):
     output = np.concatenate((b_local, b_global), axis=-1)
     return output, b_quats
 
-  @tf.function
   def normalized(self, angles):
-    lengths = tf.math.sqrt(tf.math.reduce_sum(tf.math.square(angles), axis=-1))
+    lengths = tf.sqrt(tf.reduce_sum(tf.square(angles), axis=-1))
     return angles / lengths[..., None]
     
   @tf.function

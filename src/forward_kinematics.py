@@ -11,7 +11,7 @@ class FK(object):
     return tf.matmul(t0s, t1s)
 
   def transforms_blank(self, rotations):
-    diagonal = tf.diag([1.0, 1.0, 1.0, 1.0])[None, None, :, :]
+    diagonal =  tf.linalg.diag([1.0, 1.0, 1.0, 1.0])[None, None, :, :]
     ts = tf.tile(diagonal,
                  [int(rotations.shape[0]),
                   int(rotations.shape[1]), 1, 1])
