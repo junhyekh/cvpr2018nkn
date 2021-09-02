@@ -25,13 +25,14 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
          norm_type, mem_frac, keep_prob, learning_rate, start_step):
 
   gpus = tf.config.experimental.list_physical_devices('GPU') 
-  if gpus: 
-    try: # Currently, memory growth needs to be the same across GPUs 
-      for gpu in gpus: tf.config.experimental.set_memory_growth(gpu, True) 
-      logical_gpus = tf.config.experimental.list_logical_devices('GPU') 
-      print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs") 
-    except RuntimeError as e: # Memory growth must be set before GPUs have been initialized 
-      print(e)
+
+  # if gpus: 
+  #   try: # Currently, memory growth needs to be the same across GPUs 
+  #     for gpu in gpus: tf.config.experimental.set_memory_growth(gpu, True) 
+  #     logical_gpus = tf.config.experimental.list_logical_devices('GPU') 
+  #     print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs") 
+  #   except RuntimeError as e: # Memory growth must be set before GPUs have been initialized 
+  #     print(e)
 
   prefix = "Online_Retargeting_Mixamo_Cycle_Adv"
 
@@ -60,9 +61,9 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
         if not f.startswith(".") and f.endswith("_seq.npy")
     ]
     for cfile in files:
-      positions = np.load(data_path + folder + "/" + cfile[:-8] + "_skel.npy")
+      positions = np.load(data_path + folder + "/" + cfile[:-8] + "_skel.npy").astype('float32')
       if positions.shape[0] >= min_steps:
-        sequence = np.load(data_path + folder + "/" + cfile[:-8] + "_seq.npy")
+        sequence = np.load(data_path + folder + "/" + cfile[:-8] + "_seq.npy").astype('float32')
         offset = sequence[:, -8:-4]
         sequence = np.reshape(sequence[:, :-8], [sequence.shape[0], -1, 3])
         positions[:, 0, :] = sequence[:, 0, :]
@@ -119,154 +120,154 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
 
   if not exists(logs_dir):
     makedirs(logs_dir)
-    disc_name="discriminator.model-"+str(start_step)+".h5"
-    gen_name="generator.model-"+str(start_step)+".h5"
-    loaded = gru.load(models_dir, disc_name, gen_name)
-    if loaded:
-      print("[*] Load SUCCESSFUL")
-      step = start_step
-    else:
-      print("[!] Starting from scratch ...")
-      step = 0
+  disc_name="discriminator.model-"+str(start_step)+".h5"
+  gen_name="generator.model-"+str(start_step)+".h5"
+  # loaded = gru.load(models_dir, disc_name, gen_name)
+  # if loaded:
+  #   print("[*] Load SUCCESSFUL")
+  #   step = start_step
+  # else:
+  #   print("[!] Starting from scratch ...")
+  #   step = 0
+  step = 0
+  total_steps = 50000
+  
+  while step < total_steps:
+    mini_batches = get_minibatches_idx(
+        len(trainlocal), batch_size, shuffle=True)
+    for _, batchidx in mini_batches:
+      start_time = time.time()
+      if len(batchidx) == batch_size:
 
-    total_steps = 50000
-    
-    while step < total_steps:
-      mini_batches = get_minibatches_idx(
-          len(trainlocal), batch_size, shuffle=True)
-      for _, batchidx in mini_batches:
-        start_time = time.time()
-        if len(batchidx) == batch_size:
+        if min_steps >= max_steps:
+          steps = np.repeat(max_steps, batch_size)
+        else:
+          steps = np.random.randint(
+              low=min_steps, high=max_steps + 1, size=(batch_size, ))
 
-          if min_steps >= max_steps:
-            steps = np.repeat(max_steps, batch_size)
+        realLocal_batch = []
+        realSkel_batch = []
+        realGlobal_batch = []
+        localA_batch = []
+        globalA_batch = []
+        skelA_batch = []
+        localB_batch = []
+        globalB_batch = []
+        skelB_batch = []
+        aeReg_batch = np.zeros((batch_size, 1), dtype="float32")
+        mask_batch = np.zeros((batch_size, max_steps), dtype="float32")
+
+        for b in range(batch_size):
+          low = 0
+          high = trainlocal[batchidx[b]].shape[0] - max_steps
+          if low >= high:
+            stidx = 0
           else:
-            steps = np.random.randint(
-                low=min_steps, high=max_steps + 1, size=(batch_size, ))
+            stidx = np.random.randint(low=low, high=high)
 
-          realLocal_batch = []
-          realSkel_batch = []
-          realGlobal_batch = []
-          localA_batch = []
-          globalA_batch = []
-          skelA_batch = []
-          localB_batch = []
-          globalB_batch = []
-          skelB_batch = []
-          aeReg_batch = np.zeros((batch_size, 1), dtype="float32")
-          mask_batch = np.zeros((batch_size, max_steps), dtype="float32")
+          clocalA = trainlocal[batchidx[b]][stidx:stidx + max_steps]
+          mask_batch[b, :np.min([steps[b], clocalA.shape[0]])] = 1.0
+          if clocalA.shape[0] < max_steps:
+            clocalA = np.concatenate((clocalA,
+                                      np.zeros((max_steps - clocalA.shape[0],
+                                                n_joints, 3),  dtype="float32")))
 
-          for b in range(batch_size):
-            low = 0
-            high = trainlocal[batchidx[b]].shape[0] - max_steps
-            if low >= high:
-              stidx = 0
-            else:
-              stidx = np.random.randint(low=low, high=high)
+          cglobalA = trainglobal[batchidx[b]][stidx:stidx + max_steps]
+          if cglobalA.shape[0] < max_steps:
+            cglobalA = np.concatenate(
+                (cglobalA, np.zeros((max_steps - cglobalA.shape[0], 4))))
 
-            clocalA = trainlocal[batchidx[b]][stidx:stidx + max_steps]
-            mask_batch[b, :np.min([steps[b], clocalA.shape[0]])] = 1.0
-            if clocalA.shape[0] < max_steps:
-              clocalA = np.concatenate((clocalA,
-                                        np.zeros((max_steps - clocalA.shape[0],
-                                                  n_joints, 3))))
+          cskelA = trainskel[batchidx[b]][stidx:stidx + max_steps]
+          if cskelA.shape[0] < max_steps:
+            cskelA = np.concatenate((cskelA,
+                                      np.zeros((max_steps - cskelA.shape[0],
+                                                n_joints, 3),  dtype="float32")))
 
-            cglobalA = trainglobal[batchidx[b]][stidx:stidx + max_steps]
-            if cglobalA.shape[0] < max_steps:
-              cglobalA = np.concatenate(
-                  (cglobalA, np.zeros((max_steps - cglobalA.shape[0], 4))))
+          rnd_idx = np.random.randint(len(trainlocal))
+          cskelB = trainskel[rnd_idx][stidx:stidx + max_steps]
+          if cskelB.shape[0] < max_steps:
+            cskelB = np.concatenate((cskelB,
+                                      np.zeros((max_steps - cskelB.shape[0],
+                                                n_joints, 3),  dtype="float32")))
 
-            cskelA = trainskel[batchidx[b]][stidx:stidx + max_steps]
-            if cskelA.shape[0] < max_steps:
-              cskelA = np.concatenate((cskelA,
-                                       np.zeros((max_steps - cskelA.shape[0],
-                                                 n_joints, 3))))
-
+          tgtname = allnames[rnd_idx]
+          rnd_idx = np.random.randint(len(trainlocal))
+          while tgtname != allnames[rnd_idx]:
             rnd_idx = np.random.randint(len(trainlocal))
-            cskelB = trainskel[rnd_idx][stidx:stidx + max_steps]
-            if cskelB.shape[0] < max_steps:
-              cskelB = np.concatenate((cskelB,
-                                       np.zeros((max_steps - cskelB.shape[0],
-                                                 n_joints, 3))))
 
-            tgtname = allnames[rnd_idx]
-            rnd_idx = np.random.randint(len(trainlocal))
-            while tgtname != allnames[rnd_idx]:
-              rnd_idx = np.random.randint(len(trainlocal))
+          low = 0
+          high = trainlocal[rnd_idx].shape[0] - max_steps
+          if low >= high:
+            stidx = 0
+          else:
+            stidx = np.random.randint(low=low, high=high)
 
-            low = 0
-            high = trainlocal[rnd_idx].shape[0] - max_steps
-            if low >= high:
-              stidx = 0
-            else:
-              stidx = np.random.randint(low=low, high=high)
+          crealLocal = trainlocal[rnd_idx][stidx:stidx + max_steps]
+          crealGlobal = trainglobal[rnd_idx][stidx:stidx + max_steps]
+          crealSkel = trainskel[rnd_idx][stidx:stidx + max_steps]
 
-            crealLocal = trainlocal[rnd_idx][stidx:stidx + max_steps]
-            crealGlobal = trainglobal[rnd_idx][stidx:stidx + max_steps]
-            crealSkel = trainskel[rnd_idx][stidx:stidx + max_steps]
+          regon = np.random.binomial(1, p=0.2)
+          if regon:
+            cskelB = cskelA.copy()
+            aeReg_batch[b, 0] = 1
+          else:
+            aeReg_batch[b, 0] = 0
 
-            regon = np.random.binomial(1, p=0.2)
-            if regon:
-              cskelB = cskelA.copy()
-              aeReg_batch[b, 0] = 1
-            else:
-              aeReg_batch[b, 0] = 0
+          localA_batch.append(clocalA)
+          globalA_batch.append(cglobalA)
+          skelA_batch.append(cskelA)
+          localB_batch.append(clocalA)
+          globalB_batch.append(cglobalA)
+          skelB_batch.append(cskelB)
+          realLocal_batch.append(crealLocal)
+          realGlobal_batch.append(crealGlobal)
+          realSkel_batch.append(crealSkel)
 
-            localA_batch.append(clocalA)
-            globalA_batch.append(cglobalA)
-            skelA_batch.append(cskelA)
-            localB_batch.append(clocalA)
-            globalB_batch.append(cglobalA)
-            skelB_batch.append(cskelB)
-            realLocal_batch.append(crealLocal)
-            realGlobal_batch.append(crealGlobal)
-            realSkel_batch.append(crealSkel)
+        localA_batch = np.array(localA_batch).reshape((batch_size, max_steps,
+                                                        -1))
+        globalA_batch = np.array(globalA_batch).reshape((batch_size,
+                                                          max_steps, -1))
+        seqA_batch = np.concatenate((localA_batch, globalA_batch), axis=-1)
+        skelA_batch = np.array(skelA_batch).reshape((batch_size, max_steps,
+                                                      -1))
 
-          localA_batch = np.array(localA_batch).reshape((batch_size, max_steps,
-                                                         -1))
-          globalA_batch = np.array(globalA_batch).reshape((batch_size,
-                                                           max_steps, -1))
-          seqA_batch = np.concatenate((localA_batch, globalA_batch), axis=-1)
-          skelA_batch = np.array(skelA_batch).reshape((batch_size, max_steps,
-                                                       -1))
+        localB_batch = np.array(localB_batch).reshape((batch_size, max_steps,
+                                                        -1))
+        globalB_batch = np.array(globalB_batch).reshape((batch_size,
+                                                          max_steps, -1))
+        seqB_batch = np.concatenate((localB_batch, globalB_batch), axis=-1)
+        skelB_batch = np.array(skelB_batch).reshape((batch_size, max_steps,
+                                                      -1))
 
-          localB_batch = np.array(localB_batch).reshape((batch_size, max_steps,
-                                                         -1))
-          globalB_batch = np.array(globalB_batch).reshape((batch_size,
-                                                           max_steps, -1))
-          seqB_batch = np.concatenate((localB_batch, globalB_batch), axis=-1)
-          skelB_batch = np.array(skelB_batch).reshape((batch_size, max_steps,
-                                                       -1))
+        realLocal_batch = np.array(realLocal_batch).reshape((batch_size,
+                                                              max_steps, -1))
+        realGlobal_batch = np.array(realGlobal_batch).reshape(
+            (batch_size, max_steps, -1))
+        realSeq_batch = np.concatenate(
+            (realLocal_batch, realGlobal_batch), axis=-1)
+        realSkel_batch = np.array(realSkel_batch).reshape((batch_size,
+                                                            max_steps, -1))
 
-          realLocal_batch = np.array(realLocal_batch).reshape((batch_size,
-                                                               max_steps, -1))
-          realGlobal_batch = np.array(realGlobal_batch).reshape(
-              (batch_size, max_steps, -1))
-          realSeq_batch = np.concatenate(
-              (realLocal_batch, realGlobal_batch), axis=-1)
-          realSkel_batch = np.array(realSkel_batch).reshape((batch_size,
-                                                             max_steps, -1))
+        mid_time = time.time()
+        print(seqA_batch.shape)
+        dlf, dlr, gl, lc = gru.train(
+            realSeq_batch, realSkel_batch, seqA_batch, skelA_batch,
+            seqB_batch, skelB_batch, aeReg_batch, mask_batch, step)
 
-          mid_time = time.time()
+        print("step=%d/%d,  g_loss=%.5f, d_loss=%.5f, cyc_loss=%.5f, "
+              "time=%.2f+%.2f" % (step, total_steps, gl,
+                                  dlf + dlr, lc, mid_time - start_time,
+                                  time.time() - mid_time))
 
-          dlf, dlr, gl, lc = gru.train(
-              realSeq_batch, realSkel_batch, seqA_batch, skelA_batch,
-              seqB_batch, skelB_batch, aeReg_batch, mask_batch, step)
+        if np.isnan(gl) or np.isinf(gl):
+          return
 
-          print("step=%d/%d,  g_loss=%.5f, d_loss=%.5f, cyc_loss=%.5f, "
-                "time=%.2f+%.2f" % (step, total_steps, gl,
-                                    dlf + dlr, lc, mid_time - start_time,
-                                    time.time() - mid_time))
+        if step >= 1000 and step % 1000 == 0:
+          gru.save(models_dir, step)
 
-          if np.isnan(gl) or np.isinf(gl):
-            return
+        step = step + 1
 
-          if step >= 1000 and step % 1000 == 0:
-            gru.save(models_dir, step)
-
-          step = step + 1
-
-    gru.save(models_dir, step)
+  gru.save(models_dir, step)
 
 
 if __name__ == "__main__":

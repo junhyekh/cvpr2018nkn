@@ -2,6 +2,7 @@ import os
 
 import numpy as np
 import tensorflow as tf
+from tensorflow.python import training
 
 from forward_kinematics import FK
 from ops import gaussian_noise as gnoise
@@ -15,6 +16,133 @@ from tensorflow import asin
 
 layer_norm = tf.keras.layers.LayerNormalization
 
+class Generator(tf.keras.Model):
+
+  def __init__(self, layers_units, n_joints, batch_size, kp, fk):
+    super(Generator, self).__init__()
+    self.layers_units=layers_units
+    self.n_joints=n_joints
+    self.batch_size=batch_size
+    self.enc_gru = self.gru_model(layers_units, kp)
+    self.dec_gru = self.gru_model(layers_units, kp)
+    self.fc=tf.keras.layers.Dense(4 * (self.n_joints + 1))
+    self.fk=fk
+
+  def call(self, seqA_, skelA_, skelB_, max_len, parents, dmean, dstd, training=False):
+    b_local = []
+    b_global = []
+    b_quats = []
+    a_local = []
+    a_global = []
+    a_quats = []
+
+    statesA_AB = []
+    statesB_AB = []
+    statesA_BA = []
+    statesB_BA = []
+    
+    for units in self.layers_units:
+      statesA_AB += [tf.zeros([self.batch_size, units])]
+      statesB_AB += [tf.zeros([self.batch_size, units])]
+      statesA_BA += [tf.zeros([self.batch_size, units])]
+      statesB_BA += [tf.zeros([self.batch_size, units])]
+    for t in range(max_len):
+      print(t)
+      """Retarget A to B"""       
+      ptA_in = seqA_[:, t, :]
+
+      n = self.enc_gru(tf.expand_dims(ptA_in, 1), training=training, initial_state=statesA_AB)
+      statesA_AB=n[1:]
+      if t == 0:
+        ptB_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
+      else:
+        ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
+
+      ptcombined = tf.concat(
+          values=[skelB_[:, 0, 3:], ptB_in, statesA_AB[-1]], axis=1)
+      n = self.dec_gru(tf.expand_dims(ptcombined, 1), training=training, initial_state=statesB_AB)
+      statesB_AB=n[1:]
+      angles_n_offset = self.fc(statesB_AB[-1])
+      output_angles = tf.reshape(angles_n_offset[:, :-4],
+                                  [self.batch_size, self.n_joints, 4])
+      b_global.append(angles_n_offset[:, -4:])
+      b_quats.append(self.normalized(output_angles))
+
+      skel_in = tf.reshape(skelB_[:, 0, :], [self.batch_size, self.n_joints, 3])
+      skel_in = skel_in * dstd + dmean
+      output = (self.fk.run(parents, skel_in, output_angles) - dmean) / dstd
+      output = tf.reshape(output, [self.batch_size, -1])
+      b_local.append(output)
+      """Retarget B back to A"""
+      if training:
+        ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
+
+        n= self.enc_gru(tf.expand_dims(ptB_in, 1), training=True, initial_state=statesB_BA)
+        statesB_BA=n[1:]
+
+        if t == 0:
+          ptA_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
+        else:
+          ptA_in = tf.concat([a_local[-1], a_global[-1]], axis=-1)
+
+        ptcombined = tf.concat(
+            values=[skelA_[:, 0, 3:], ptA_in, statesB_BA[-1]], axis=1)
+        n = self.dec_gru(tf.expand_dims(ptcombined, 1), training=True, initial_state=statesA_BA)
+        statesA_BA=n[1:]
+        angles_n_offset = self.fc(statesA_BA[-1])
+        output_angles = tf.reshape(angles_n_offset[:, :-4],
+                                  [self.batch_size, self.n_joints, 4])
+        a_global.append(angles_n_offset[:, -4:])
+        a_quats.append(self.normalized(output_angles))
+
+        skel_in = tf.reshape(skelA_[:, 0, :], [self.batch_size, self.n_joints, 3])
+        skel_in = skel_in * dstd + dmean
+
+        output = (self.fk.run(parents, skel_in, output_angles) - dmean) / dstd
+        output = tf.reshape(output, [self.batch_size, -1])
+        a_local.append(output)
+
+      return b_local, b_global, b_quats, a_local, a_global, a_quats
+
+  def gru_model(self, layers_units, kp, rnn_type="GRU"):
+    gru_cells = [tf.keras.layers.GRUCell(units, dropout=(1-kp)) for units in layers_units]
+    gru_layer=tf.keras.layers.RNN(gru_cells, return_state=True)
+    return gru_layer
+  
+  def normalized(self, angles):
+    lengths = tf.sqrt(tf.reduce_sum(tf.square(angles), axis=-1))
+    return angles / lengths[..., None]
+
+class Discriminator(tf.keras.Model):
+  def __init__(self):
+    super(Discriminator, self).__init__()
+    self.norm1=tf.keras.layers.BatchNormalization()
+    self.norm2=tf.keras.layers.BatchNormalization()
+    self.norm3=tf.keras.layers.BatchNormalization()
+    self.lrelu=tf.keras.layers.LeakyReLU()
+    self.lrelu1=tf.keras.layers.LeakyReLU()
+    self.lrelu2=tf.keras.layers.LeakyReLU()
+    self.lrelu3=tf.keras.layers.LeakyReLU()
+    self.conv1=tf.keras.layers.Conv1D(32, 4, strides=2, padding='same', name="conv1d_h0")
+    self.conv2=tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h1")
+    self.conv3=tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h2")
+    self.conv4=tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h3")
+    self.conv5=tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")
+    #x= tf.cond(tf.greater(drop, 0), lambda: tf.keras.layers.Dropout(0.3)(x), lambda: x)
+    #x=tf.nn.dropout(x, rate=0.3)
+  def call(self, x, cond, batch_size, training=False):
+    if training:
+      x=tf.nn.dropout(x, rate=0.3)
+    h0=self.lrelu(self.conv1(x))
+    h1=self.lrelu1(self.norm1(self.conv2(h0), training=training))
+    h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
+    h2=self.lrelu2(self.norm2(self.conv3(h1), training=training))
+    h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
+    h3=self.lrelu3(self.norm3(self.conv4(h2), training=training))
+    h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
+    logits = self.conv5(h3)
+    out=tf.reshape(logits, [batch_size, 1])
+    return out
 
 class EncoderDecoderGRU(object):
   def __init__(self,
@@ -66,8 +194,8 @@ class EncoderDecoderGRU(object):
     self.ostd=ostd
     self.parents=parents
 
-    self.gen=self.generator(layers_units)
-    self.disc=self.discriminator(tf.concat([tf.zeros((max_len, 3 * n_joints + 4))[:,:-4][1:, :], (tf.zeros((max_len, 3 * n_joints + 4))[:,-4:])[:-1, :]],-1),tf.zeros((max_len, 3 * n_joints))[0:1, 3:])
+    self.gen=Generator(layers_units, n_joints, batch_size, self.kp, self.fk)
+    self.disc=Discriminator()
 
     self.goptimizer = tf.keras.optimizers.Adam(
             self.learning_rate, beta_1=0.5, name="goptimizer")
@@ -76,161 +204,13 @@ class EncoderDecoderGRU(object):
             self.learning_rate, beta_1=0.5, name="doptimizer")
     self.writer  = tf.summary.create_file_writer(logs_dir)
     
-  def generator(self, layers_units):
-    enc_gru = self.gru_model(layers_units)
-    dec_gru = self.gru_model(layers_units)
-
-    seqA_ = tf.keras.Input(
-        shape=(self.max_len, 3 * self.n_joints + 4),
-        batch_size=self.batch_size,
-        name="seqA")
-    skelA_ = tf.keras.Input(
-        shape=(self.max_len, 3 * self.n_joints),
-        batch_size=self.batch_size,
-        name="skelA_")
-    skelB_ = tf.keras.Input(
-        shape=(self.max_len, 3 * self.n_joints),
-        batch_size=self.batch_size,
-        name="skelB")
-
-    b_local = []
-    b_global = []
-    b_quats = []
-    a_local = []
-    a_global = []
-    a_quats = []
-
-    statesA_AB = []
-    statesB_AB = []
-    statesA_BA = []
-    statesB_BA = []
-    fc=tf.keras.layers.Dense(4 * (self.n_joints + 1))
-    for units in layers_units:
-      statesA_AB += [tf.zeros([self.batch_size, units])]
-      statesB_AB += [tf.zeros([self.batch_size, units])]
-      statesA_BA += [tf.zeros([self.batch_size, units])]
-      statesB_BA += [tf.zeros([self.batch_size, units])]
-    for t in range(self.max_len):
-      """Retarget A to B"""       
-      ptA_in = seqA_[:, t, :]
-
-      n = enc_gru(tf.expand_dims(ptA_in, 1), initial_state=statesA_AB)
-      statesA_AB=n[1:]
-      if t == 0:
-        ptB_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
-      else:
-        ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
-
-      ptcombined = tf.concat(
-          values=[skelB_[:, 0, 3:], ptB_in, statesA_AB[-1]], axis=1)
-      n = dec_gru(tf.expand_dims(ptcombined, 1), initial_state=statesB_AB)
-      statesB_AB=n[1:]
-      angles_n_offset = fc(statesB_AB[-1])
-      output_angles = tf.reshape(angles_n_offset[:, :-4],
-                                  [self.batch_size, self.n_joints, 4])
-      b_global.append(angles_n_offset[:, -4:])
-      b_quats.append(self.normalized(output_angles))
-
-      skel_in = tf.reshape(skelB_[:, 0, :], [self.batch_size, self.n_joints, 3])
-      skel_in = skel_in * self.dstd + self.dmean
-
-      output = (self.fk.run(self.parents, skel_in, output_angles) - self.dmean) / self.dstd
-      output = tf.reshape(output, [self.batch_size, -1])
-      b_local.append(output)
-      """Retarget B back to A"""
-      ptB_in = tf.concat([b_local[-1], b_global[-1]], axis=-1)
-
-      n= enc_gru(tf.expand_dims(ptB_in, 1), initial_state=statesB_BA)
-      statesB_BA=n[1:]
-
-      if t == 0:
-        ptA_in = tf.zeros([self.batch_size, 3 * self.n_joints + 4])
-      else:
-        ptA_in = tf.concat([a_local[-1], a_global[-1]], axis=-1)
-
-      ptcombined = tf.concat(
-          values=[skelA_[:, 0, 3:], ptA_in, statesB_BA[-1]], axis=1)
-      n = dec_gru(tf.expand_dims(ptcombined, 1), initial_state=statesA_BA)
-      statesA_BA=n[1:]
-      angles_n_offset = fc(statesA_BA[-1])
-      output_angles = tf.reshape(angles_n_offset[:, :-4],
-                                [self.batch_size, self.n_joints, 4])
-      a_global.append(angles_n_offset[:, -4:])
-      a_quats.append(self.normalized(output_angles))
-
-      skel_in = tf.reshape(skelA_[:, 0, :], [self.batch_size, self.n_joints, 3])
-      skel_in = skel_in * self.dstd + self.dmean
-
-      output = (self.fk.run(self.parents, skel_in, output_angles) - self.dmean) / self.dstd
-      output = tf.reshape(output, [self.batch_size, -1])
-      a_local.append(output)
-
-      return tf.keras.Model(inputs=[seqA_, skelA_, skelB_], outputs=[b_local, b_global, b_quats, a_local, a_global, a_quats]) 
+  
 
   # def mlp_out(self, input_, reuse=False, name="mlp_out"):
   #   out = qlinear(input_, 4 * (self.n_joints + 1), name="dec_fc")
   #   return out
 
-  def gru_model(self, layers_units, rnn_type="GRU"):
-    gru_cells = [tf.keras.layers.GRUCell(units, dropout=(1-self.kp)) for units in layers_units]
-    gru_layer=tf.keras.layers.RNN(gru_cells, return_state=True)
-    return gru_layer
-
-  def discriminator(self, input_, cond_):
-    print(input_.get_shape(), cond_.get_shape())
-    x=tf.keras.Input(shape=input_.get_shape())
-    cond=tf.keras.Input(shape=cond_.get_shape())
-    norm1=tf.keras.layers.BatchNormalization()
-    norm2=tf.keras.layers.BatchNormalization()
-    norm3=tf.keras.layers.BatchNormalization()
-    lrelu=tf.keras.layers.LeakyReLU()
-    lrelu1=tf.keras.layers.LeakyReLU()
-    lrelu2=tf.keras.layers.LeakyReLU()
-    lrelu3=tf.keras.layers.LeakyReLU()
-    #x= tf.cond(tf.greater(drop, 0), lambda: tf.keras.layers.Dropout(0.3)(x), lambda: x)
-    #x=tf.nn.dropout(x, rate=0.3)
-    if self.d_arch == 0:
-      h0=lrelu(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h0")(x))
-      h1=lrelu1(norm1(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
-      h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2=lrelu2(norm2(tf.keras.layers.Conv1D(512, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
-      h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3=lrelu3(norm3(tf.keras.layers.Conv1D(1024, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
-      h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
-      logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
-    elif self.d_arch == 1:
-      h0=lrelu(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h0")(x))
-      h1=lrelu1(norm1(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
-      h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2=lrelu2(norm2(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
-      h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3=lrelu3(norm3(tf.keras.layers.Conv1D(512, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
-      h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
-      logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
-    elif self.d_arch == 2:
-      h0=lrelu(tf.keras.layers.Conv1D(32, 4, strides=2, padding='same', name="conv1d_h0")(x))
-      h1=lrelu1(norm1(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
-      h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2=lrelu2(norm2(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
-      h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3=lrelu3(norm3(tf.keras.layers.Conv1D(256, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
-      h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
-      logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
-    elif self.d_arch == 3:
-      h0=lrelu(tf.keras.layers.Conv1D(16, 4, strides=2, padding='same', name="conv1d_h0")(x))
-      h1=lrelu(norm1(tf.keras.layers.Conv1D(32, 4, strides=2, padding='same', name="conv1d_h1")(h0)))
-      h1 = tf.concat([h1, tf.tile(cond, [1, int(h1.shape[1]), 1])], axis=-1)
-      h2=lrelu(norm2(tf.keras.layers.Conv1D(64, 4, strides=2, padding='same', name="conv1d_h2")(h1)))
-      h2 = tf.concat([h2, tf.tile(cond, [1, int(h2.shape[1]), 1])], axis=-1)
-      h3=lrelu(norm3(tf.keras.layers.Conv1D(128, 4, strides=2, padding='same', name="conv1d_h3")(h2)))
-      h3 = tf.concat([h3, tf.tile(cond, [1, int(h3.shape[1]), 1])], axis=-1)
-      logits = tf.keras.layers.Conv1D(1, 4, strides=2, name="logits", padding="valid")(h3)
-    else:
-      raise Exception("Unknown discriminator architecture!!!")
-    out=tf.reshape(logits, [self.batch_size, 1])
-    return tf.keras.Model(inputs=[x, cond], outputs=out)
-
-  def cyc_loss(self, seqA_, seqB_, mask_):
+  def cyc_loss(self, seqA_, seqB_, mask_, aeReg_):
     output_localA = self.localA
     target_seqA = seqA_[:, :, :-4]
     cycle_local_loss = tf.reduce_sum(
@@ -259,19 +239,19 @@ class EncoderDecoderGRU(object):
     target_seqB = seqB_[:, :, :-4]
     interm_local_loss = tf.reduce_sum(
         tf.square(
-            tf.multiply(self.aeReg_[:, :, None] * mask_[:, :, None],
+            tf.multiply(aeReg_[:, :, None] * mask_[:, :, None],
                         tf.subtract(output_localB, target_seqB))))
     interm_local_loss = tf.divide(
         interm_local_loss,
-        tf.maximum(tf.reduce_sum(self.aeReg_ * mask_), 1))
+        tf.maximum(tf.reduce_sum(aeReg_ * mask_), 1))
 
     interm_global_loss = tf.reduce_sum(
         tf.square(
-            tf.multiply(self.aeReg_[:, :, None] * mask_[:, :, None],
+            tf.multiply(aeReg_[:, :, None] * mask_[:, :, None],
                         tf.subtract(seqB_[:, :, -4:], self.globalB))))
     interm_global_loss = tf.divide(
         interm_global_loss,
-        tf.maximum(tf.reduce_sum(self.aeReg_ * mask_), 1))
+        tf.maximum(tf.reduce_sum(aeReg_ * mask_), 1))
 
     dnorm_offB_ = self.globalB * self.ostd + self.omean
     interm_smooth = tf.reduce_sum(
@@ -308,23 +288,23 @@ class EncoderDecoderGRU(object):
 
     return L_disc_real, L_disc_fake
 
-  def gen_loss(self, fake_logits):
+  def gen_loss(self, fake_logits, aeReg_):
     L_gen = tf.reduce_sum(
-          tf.multiply((1 - self.aeReg_),
+          tf.multiply((1 - aeReg_),
                       tf.nn.sigmoid_cross_entropy_with_logits(
                           logits=fake_logits,
                           labels=tf.ones_like(fake_logits))))
     L_gen = tf.divide(L_gen,
-                            tf.maximum(tf.reduce_sum(1 - self.aeReg_), 1))
+                            tf.maximum(tf.reduce_sum(1 - aeReg_), 1))
 
     return L_gen
 
-  @tf.function
-  def train(self, realSeq_, realSkel_, seqA_, skelA_, seqB_, skelB_, mask_,
+  def train(self, realSeq_, realSkel_, seqA_, skelA_, seqB_, skelB_, aeReg_, mask_,
             step):
     with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
       mask_=tf.convert_to_tensor(mask_)
-      b_local, b_global, b_quats, a_local, a_global, a_quats=self.gen(seqA_, skelA_, skelB_)
+      print(seqA_.dtype, skelA_.dtype, skelB_.dtype)
+      b_local, b_global, b_quats, a_local, a_global, a_quats=self.gen(seqA_, skelA_, skelB_, self.max_len, self.parents, self.dmean, self.dstd, training=True)
       self.localB = tf.stack(b_local, axis=1)
       self.globalB = tf.stack(b_global, axis=1)
       self.quatB = tf.stack(b_quats, axis=1)
@@ -345,7 +325,7 @@ class EncoderDecoderGRU(object):
 
       diff_seq = dnorm_seq[:, 1:, :] - dnorm_seq[:, :-1, :]
       real_data = tf.concat([diff_seq, dnorm_off[:, :-1, :]], axis=-1)
-      real_logits = self.disc(real_data, skel_)
+      real_logits = self.disc(real_data, skel_, self.batch_size, training=True)
       real_out = tf.sigmoid(real_logits)
       seqB = tf.concat([self.localB, self.globalB], axis=-1)
       dnorm_seqB = seqB[:, :, :-4] * dstd + dmean
@@ -354,7 +334,7 @@ class EncoderDecoderGRU(object):
       fake_data = tf.concat([diff_seqB, dnorm_offB[:, :-1, :]], axis=-1)
       if self.fake_score > self.margin:
         print("update D")
-        fake_logits = self.disc(fake_data, skelB_[:, 0:1, 3:])
+        fake_logits = self.disc(fake_data, skelB_[:, 0:1, 3:], self.batch_size, training=True)
         fake_out = tf.sigmoid(fake_logits)
         cur_score=fake_out.mean()
         #cur_score = self.D_.eval(feed_dict=feed_dict).mean()
@@ -366,19 +346,19 @@ class EncoderDecoderGRU(object):
         
 
       print("update G")
-      fake_logits_g=self.disc(fake_data, skelB_[:, 0:1, 3:])
+      fake_logits_g=self.disc(fake_data, skelB_[:, 0:1, 3:], self.batch_size)
       fake_out_g=tf.sigmoid(fake_logits_g)
       cur_score =fake_out_g.mean()
       self.fake_score = 0.99 * self.fake_score + 0.01 * cur_score
 
-      cycle_local_loss, cycle_global_loss, interm_local_loss, interm_global_loss, cycle_smooth, interm_smooth = self.cyc_loss(seqA_, seqB_, mask_)
+      cycle_local_loss, cycle_global_loss, interm_local_loss, interm_global_loss, cycle_smooth, interm_smooth = self.cyc_loss(seqA_, seqB_, mask_, aeReg_)
       twist_loss=self.twist_loss()
       smoothness = 0.5 * (interm_smooth + cycle_smooth)
       overall_loss = (
           cycle_local_loss + cycle_global_loss +
           interm_local_loss + interm_global_loss +
           self.gamma * twist_loss + self.omega * smoothness)
-      L_gen=self.gen_loss(fake_logits_g)
+      L_gen=self.gen_loss(fake_logits_g, aeReg_)
       L = self.beta * L_gen + overall_loss
       generator_gradients=gen_tape.gradient(L, self.gen.trainable_variables)
       self.goptimizer.apply_gradients(zip(generator_gradients, self.gen.trainable_variables))
@@ -402,7 +382,7 @@ class EncoderDecoderGRU(object):
 
   def predict(self, seqA_, skelA_, skelB_):
     
-    b_local, b_global, b_quats, _, _, _=self.gen(seqA_, skelA_, skelB_)
+    b_local, b_global, b_quats, _, _, _=self.gen(seqA_, skelA_, skelB_, self.max_len, self.parents, self.dmean, self.dstd)
     output = np.concatenate((b_local, b_global), axis=-1)
     return output, b_quats
 
