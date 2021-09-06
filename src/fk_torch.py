@@ -11,7 +11,7 @@ class FK(object):
     return torch.matmul(t0s, t1s)
 
   def transforms_blank(self, rotations):
-    diagonal =  torch.diag([1.0, 1.0, 1.0, 1.0])[None, None, :, :]
+    diagonal =  torch.diag(torch.ones(4, device="cuda"))[None, None, :, :]
     ts = torch.tile(diagonal,
                  (int(rotations.shape[0]),
                   int(rotations.shape[1]), 1, 1))
@@ -50,8 +50,8 @@ class FK(object):
     transforms = torch.cat([transforms, positions[:, :, :, None]], -1)
     zeros = torch.zeros(
         int(transforms.shape[0]),
-         int(transforms.shape[1]), 1, 3)
-    ones = torch.ones(int(transforms.shape[0]), int(transforms.shape[1]), 1, 1)
+         int(transforms.shape[1]), 1, 3, device="cuda")
+    ones = torch.ones(int(transforms.shape[0]), int(transforms.shape[1]), 1, 1, device="cuda")
     zerosones = torch.cat([zeros, ones], dim=-1)
     transforms = torch.cat([transforms, zerosones], dim=-2)
     return transforms
@@ -61,7 +61,7 @@ class FK(object):
     globals = self.transforms_blank(rotations)
 
     globals = torch.cat([locals[:, 0:1], globals[:, 1:]], dim=1)
-    globals = torch.split(globals, int(globals.shape[1]), dim=1)
+    globals = list(torch.split(globals, 1, dim=1))
     for i in range(1, positions.shape[1]):
       globals[i] = self.transforms_multiply(globals[parents[i]][:, 0],
                                             locals[:, i])[:, None, :, :]

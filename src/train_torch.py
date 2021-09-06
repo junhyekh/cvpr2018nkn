@@ -17,8 +17,6 @@ from utils import get_minibatches_idx
 from utils import numpy_gaussian_noise
 from utils import get_floor
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
 
 def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
          euler_ord, max_steps, min_steps, num_layer, gru_units, optim,
@@ -259,13 +257,13 @@ def main(gpu, batch_size, alpha, beta, gamma, omega, margin, d_arch, d_rand,
                                         dlf + dlr, lc, mid_time - start_time,
                                         time.time() - mid_time))
 
-                if np.isnan(gl) or np.isinf(gl):
+                if np.isnan(gl.detach().cpu().numpy()) or np.isinf(gl.detach().cpu().numpy()):
                     return
 
                 if step >= 1000 and step % 1000 == 0:
                     gru.save(models_dir, step)
 
-                    step = step + 1
+                step = step + 1
 
     gru.save(models_dir, step)
 

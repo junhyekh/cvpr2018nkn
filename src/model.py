@@ -44,13 +44,13 @@ class EncoderDecoderGRU(object):
         self.norm_type = norm_type
 
         self.layers_units=layers_units
-        self.dstd=dstd
-        self.dmean=dmean
-        self.omean=omean
-        self.ostd=ostd
+        self.dstd=torch.tensor(dstd, device="cuda")
+        self.dmean=torch.tensor(dmean, device="cuda")
+        self.omean=torch.tensor(omean, device="cuda")
+        self.ostd=torch.tensor(ostd, device="cuda")
         self.parents=parents
 
-        self.device='cuda:0'
+        self.device="cuda"
 
         self.BCE=torch.nn.BCEWithLogitsLoss()
 
@@ -59,7 +59,6 @@ class EncoderDecoderGRU(object):
         self.gen.train()
         self.disc=Discriminator(C=59, L=3*n_joints+4, L_C=3*n_joints-3).to(self.device)
         self.disc.train()
-
         self.goptimizer = torch.optim.Adam(self.gen.parameters(),
                 lr=self.learning_rate, betas=(0.5, 0.999))
 
@@ -106,7 +105,7 @@ class EncoderDecoderGRU(object):
                             torch.subtract(output_localB, target_seqB))))
         interm_local_loss = torch.divide(
             interm_local_loss,
-            torch.maximum(torch.sum(aeReg_ * mask_), 1))
+            torch.maximum(torch.sum(aeReg_ * mask_), torch.ones(1, device="cuda")))
 
         interm_global_loss = torch.sum(
             torch.square(
@@ -114,7 +113,7 @@ class EncoderDecoderGRU(object):
                             torch.subtract(seqB_[:, :, -4:], self.globalB))))
         interm_global_loss = torch.divide(
             interm_global_loss,
-            torch.maximum(torch.sum(aeReg_ * mask_), 1))
+            torch.maximum(torch.sum(aeReg_ * mask_), torch.ones(1, device="cuda")))
 
         dnorm_offB_ = self.globalB * self.ostd + self.omean
         interm_smooth = torch.sum(
@@ -122,7 +121,7 @@ class EncoderDecoderGRU(object):
                 torch.multiply(mask_[:, 1:, None],
                             dnorm_offB_[:, 1:] - dnorm_offB_[:, :-1])))
         interm_smooth = torch.divide(interm_smooth,
-                                        torch.maximum(torch.sum(mask_), 1))
+                                        torch.maximum(torch.sum(mask_),torch.ones(1, device="cuda")))
         return cycle_local_loss, cycle_global_loss, interm_local_loss, interm_global_loss, cycle_smooth, interm_smooth 
   
     def twist_loss(self):
@@ -130,22 +129,22 @@ class EncoderDecoderGRU(object):
         twist_loss1 = torch.mean(
             torch.square(
                 torch.maximum(
-                    0.0,
+                    torch.zeros(1, device="cuda"),
                     torch.abs(self.euler(self.quatB, self.euler_ord)) - rads * np.pi)))
         twist_loss2 = torch.mean(
             torch.square(
                 torch.maximum(
-                    0.0,
+                    torch.zeros(1, device="cuda"),
                     torch.abs(self.euler(self.quatA, self.euler_ord)) - rads * np.pi)))
         """Twist loss"""
         return 0.5 * (twist_loss1 + twist_loss2)
   
     def disc_loss(self, real_logits, fake_logits):
         L_disc_real = torch.mean(
-           self.BCE(real_logits, Target=torch.ones_like(real_logits)))
+           self.BCE(real_logits, torch.ones_like(real_logits)))
 
         L_disc_fake = torch.mean(
-           self.BCE(logits=fake_logits, labels=torch.zeros_like(fake_logits)))
+           self.BCE(fake_logits, torch.zeros_like(fake_logits)))
 
         return L_disc_real, L_disc_fake
 
@@ -153,10 +152,10 @@ class EncoderDecoderGRU(object):
         L_gen = torch.sum(
             torch.multiply((1 - aeReg_),
                         self.BCE(
-                            logits=fake_logits,
-                            labels=torch.ones_like(fake_logits))))
+                            fake_logits,
+                            torch.ones_like(fake_logits))))
         L_gen = torch.divide(L_gen,
-                            torch.maximum(torch.sum(1 - aeReg_), 1))
+                            torch.maximum(torch.sum(1 - aeReg_), torch.ones(1, device="cuda")))
 
         return L_gen
 
@@ -202,12 +201,13 @@ class EncoderDecoderGRU(object):
             self.disc.zero_grad()
             fake_logits = self.disc(fake_data.detach(), skelB_[:, 0:1, 3:], 0.7, training=True)
             fake_logits=torch.reshape(fake_logits, (self.batch_size, 1))
-            real_logits = self.disc(real_data, skel_, 0, training=True)
+            real_logits = self.disc(real_data, skel_, 0.7, training=True)
             real_logits=torch.reshape(real_logits, (self.batch_size, 1))
             fake_out = torch.sigmoid(fake_logits)
             cur_score=fake_out.mean()
             #cur_score = self.D_.eval(feed_dict=feed_dict).mean()
             self.fake_score = 0.99 * self.fake_score + 0.01 * cur_score
+            print(cur_score, self.fake_score)
             self.L_disc_real, self.L_disc_fake=self.disc_loss(real_logits, fake_logits)
             d_loss=self.L_disc_real +self.L_disc_fake
             d_loss.backward()
@@ -216,7 +216,7 @@ class EncoderDecoderGRU(object):
             self.set_grad(self.disc, False)
 
         print("update G")
-        fake_logits_g=self.disc(fake_data, skelB_[:, 0:1, 3:], self.batch_size)
+        fake_logits_g=self.disc(fake_data, skelB_[:, 0:1, 3:], 0, True)
         fake_out_g=torch.sigmoid(fake_logits_g)
         cur_score =fake_out_g.mean()
         self.fake_score = 0.99 * self.fake_score + 0.01 * cur_score
@@ -233,21 +233,20 @@ class EncoderDecoderGRU(object):
         L.backward()
         torch.nn.utils.clip_grad_norm_(self.gen.parameters(), 25)
         self.goptimizer.step()
-        with self.writer.as_default():
-            self.writer.add_scalar("losses/cycle_local_loss",
-                                                cycle_local_loss, step)
-            self.writer.add_scalar("losses/cycle_global_loss",
-                                                cycle_global_loss, step)
-            self.writer.add_scalar("losses/interm_local_loss",
-                                                interm_local_loss, step)
-            self.writer.add_scalar("losses/interm_global_loss",
-                                                interm_global_loss, step)
-            self.writer.add_scalar("losses/twist_loss", twist_loss, step)
-            self.writer.add_scalar("losses/smoothness", smoothness, step)
+        self.writer.add_scalar("losses/cycle_local_loss",
+                                            cycle_local_loss, step)
+        self.writer.add_scalar("losses/cycle_global_loss",
+                                            cycle_global_loss, step)
+        self.writer.add_scalar("losses/interm_local_loss",
+                                            interm_local_loss, step)
+        self.writer.add_scalar("losses/interm_global_loss",
+                                            interm_global_loss, step)
+        self.writer.add_scalar("losses/twist_loss", twist_loss, step)
+        self.writer.add_scalar("losses/smoothness", smoothness, step)
 
-            self.writer.add_scalar("losses/disc_real", self.L_disc_real, step)
-            self.writer.add_scalar("losses/disc_fake", self.L_disc_fake, step)
-            self.writer.add_scalar("losses/disc_gen", L_gen, step)
+        self.writer.add_scalar("losses/disc_real", self.L_disc_real, step)
+        self.writer.add_scalar("losses/disc_fake", self.L_disc_fake, step)
+        self.writer.add_scalar("losses/disc_gen", L_gen, step)
 
         return self.L_disc_fake, self.L_disc_real, L_gen, overall_loss
 
