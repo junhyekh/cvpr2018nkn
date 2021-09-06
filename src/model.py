@@ -57,14 +57,14 @@ class EncoderDecoderGRU(object):
         self.gen=Generator(layers_units[0] ,len(layers_units), n_joints,
             batch_size, self.kp).to(self.device)
         self.gen.train()
-        self.disc=Discriminator(C=59, L=3*n_joints+4).to(self.device)
+        self.disc=Discriminator(C=59, L=3*n_joints+4, L_C=3*n_joints-3).to(self.device)
         self.disc.train()
 
         self.goptimizer = torch.optim.Adam(self.gen.parameters(),
-                lf=self.learning_rate, betas=(0.5, 0.999), name="goptimizer")
+                lr=self.learning_rate, betas=(0.5, 0.999))
 
         self.doptimizer = torch.optim.Adam(self.disc.parameters(),
-                lf=self.learning_rate, betas=(0.5, 0.999), name="doptimizer")
+                lr=self.learning_rate, betas=(0.5, 0.999))
         self.writer = SummaryWriter(logs_dir)
     
   
@@ -170,7 +170,6 @@ class EncoderDecoderGRU(object):
 
     def train(self, realSeq_, realSkel_, seqA_, skelA_, seqB_, skelB_, aeReg_, mask_,
             step):
-        mask_=torch.from_numpy(mask_)
         self.gen.zero_grad()
         b_local, b_global, b_quats, a_local, a_global, a_quats=self.gen(seqA_, skelA_, skelB_, self.max_len, self.parents, self.dmean, self.dstd, training=True)
         self.localB = torch.stack(b_local, dim=1)

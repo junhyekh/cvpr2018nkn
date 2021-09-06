@@ -53,7 +53,7 @@ class Generator(nn.Module):
         statesA_BA = []
         statesB_BA = []
         
-        for _ in self.num_layers:
+        for _ in range(self.num_layers):
             statesA_AB += [torch.zeros((self.batch_size, self.hidden_size))]
             statesB_AB += [torch.zeros((self.batch_size, self.hidden_size))]
             statesA_BA += [torch.zeros((self.batch_size, self.hidden_size))]
@@ -117,22 +117,22 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, C, L):
+    def __init__(self, C, L, L_C):
         super(Discriminator, self).__init__()
         self.norm1=nn.BatchNorm1d(64)
         self.norm2=nn.BatchNorm1d(128)
         self.norm3=nn.BatchNorm1d(256)
         self.lrelu=nn.LeakyReLU()
         self.conv1=nn.Conv1d(in_channels=C, out_channels=32, kernel_size=4, stride=2, 
-            padding=(L+2)/2, name="conv1d_h0")
+            padding=(L+2)/2)
         self.conv2=nn.Conv1d(in_channels=32, out_channels=64, kernel_size=4, stride=2,
-            padding=(L+2)/2, name="conv1d_h1")
+            padding=(L+2)/2)
         self.conv3=nn.Conv1d(in_channels=64, out_channels=128, kernel_size=4, stride=2,
-            padding=(L+2)/2, name="conv1d_h2")
+            padding=(L+L_C+2)/2)
         self.conv4=nn.Conv1d(in_channels=128, out_channels=256, kernel_size=4, stride=2,
-            padding=(L+2)/2, name="conv1d_h3")
+            padding=(L+L_C+2)/2)
         self.conv5=nn.Conv1d(in_channels=256, out_channels=1, kernel_size=4, stride=2,
-            name="logits", padding=0)
+            padding=0)
 
     def forword(self, x, cond, kp, training=False):
         x=F.dropout(x,1-kp, training=training)
